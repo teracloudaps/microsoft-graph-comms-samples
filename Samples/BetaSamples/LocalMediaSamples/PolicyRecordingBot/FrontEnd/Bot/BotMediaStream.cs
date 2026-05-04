@@ -67,6 +67,7 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
         // Enhanced participant tracking
         private ConcurrentDictionary<string, ParticipantInfo> participantsById =
             new ConcurrentDictionary<string, ParticipantInfo>();
+            
         private ConcurrentDictionary<uint, string> msiToParticipantId =
             new ConcurrentDictionary<uint, string>();
 
