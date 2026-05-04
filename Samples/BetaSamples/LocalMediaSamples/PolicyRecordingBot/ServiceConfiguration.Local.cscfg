@@ -15,6 +15,7 @@
          This setting is commonly used for creating a CNAME record that points to the service's DNS name.
          It allows you to map a custom domain name to the service’s DNS name. 
          Replace %ServiceCName% with the desired CNAME, such as 'custom.mydomain.com'. -->
+      <Setting name="HomeTenantId" value="" />
       <Setting name="DefaultCertificate" value="ABC0000000000000000000000000000000000CBA" />
       <Setting name="APPINSIGHTS_INSTRUMENTATIONKEY" value="" />
     </ConfigurationSettings>

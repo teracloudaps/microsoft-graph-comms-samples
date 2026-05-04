@@ -37,6 +37,10 @@
     <Compile Include="Bot\BotMediaStream.cs" />
     <Compile Include="Bot\CallHandler.cs" />
     <Compile Include="Bot\ExceptionExtensions.cs" />
+    <Compile Include="Bot\IAudioBlobSink.cs" />
+    <Compile Include="Bot\IdentifiedAudioBlob.cs" />
+    <Compile Include="Bot\NullAudioBlobSink.cs" />
+    <Compile Include="Bot\ParticipantIdentityMetadata.cs" />
     <Compile Include="Http\ExceptionLogger.cs" />
     <Compile Include="SampleConstants.cs" />
     <Compile Include="Http\Controllers\DemoController.cs" />

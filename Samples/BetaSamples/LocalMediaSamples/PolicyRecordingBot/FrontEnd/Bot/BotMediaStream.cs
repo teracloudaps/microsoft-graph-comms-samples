@@ -11,8 +11,11 @@
 namespace Sample.PolicyRecordingBot.FrontEnd.Bot
 {
     using System;
+    using System.Collections.Concurrent;
     using System.Collections.Generic;
     using System.Linq;
+    using System.Runtime.InteropServices;
+    using System.Threading;
     using Microsoft.Graph.Communications.Calls.Media;
     using Microsoft.Graph.Communications.Common;
     using Microsoft.Graph.Communications.Common.Telemetry;
@@ -28,20 +31,29 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
         private readonly IVideoSocket vbssSocket;
         private readonly List<IVideoSocket> videoSockets;
         private readonly ILocalMediaSession mediaSession;
+        private readonly CallHandler callHandler;
+        private readonly IAudioBlobSink audioBlobSink;
+        private readonly ConcurrentDictionary<uint, long> audioSequenceNumbers = new ConcurrentDictionary<uint, long>();
+        private long mixedAudioSequenceNumber;
 
         /// <summary>
         /// Initializes a new instance of the <see cref="BotMediaStream"/> class.
         /// </summary>
         /// <param name="mediaSession">The media session.</param>
+        /// <param name="callHandler">The call handler.</param>
         /// <param name="logger">Graph logger.</param>
+        /// <param name="audioBlobSink">Audio blob sink.</param>
         /// <exception cref="InvalidOperationException">Throws when no audio socket is passed in.</exception>
-        public BotMediaStream(ILocalMediaSession mediaSession, IGraphLogger logger)
+        internal BotMediaStream(ILocalMediaSession mediaSession, CallHandler callHandler, IGraphLogger logger, IAudioBlobSink audioBlobSink = null)
             : base(logger)
         {
             ArgumentVerifier.ThrowOnNullArgument(mediaSession, nameof(mediaSession));
+            ArgumentVerifier.ThrowOnNullArgument(callHandler, nameof(callHandler));
             ArgumentVerifier.ThrowOnNullArgument(logger, nameof(logger));
 
             this.mediaSession = mediaSession;
+            this.callHandler = callHandler;
+            this.audioBlobSink = audioBlobSink ?? NullAudioBlobSink.Instance;
 
             // Subscribe to the audio media.
             this.audioSocket = mediaSession.AudioSocket;
@@ -158,6 +170,46 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
         }
 
         /// <summary>
+        /// Creates a stable stream identifier from the call and media source identifiers.
+        /// </summary>
+        /// <param name="callId">The call identifier.</param>
+        /// <param name="mediaSourceId">The media source identifier.</param>
+        /// <returns>The stream identifier.</returns>
+        private static string CreateStreamId(string callId, string mediaSourceId)
+        {
+            return $"{callId}:{mediaSourceId}";
+        }
+
+        /// <summary>
+        /// Creates a stable blob identifier from the stream identifier and sequence number.
+        /// </summary>
+        /// <param name="streamId">The stream identifier.</param>
+        /// <param name="sequenceNumber">The stream sequence number.</param>
+        /// <returns>The blob identifier.</returns>
+        private static string CreateBlobId(string streamId, long sequenceNumber)
+        {
+            return $"{streamId}:{sequenceNumber:D20}";
+        }
+
+        /// <summary>
+        /// Copies unmanaged media buffer data into managed memory.
+        /// </summary>
+        /// <param name="data">The unmanaged buffer pointer.</param>
+        /// <param name="length">The buffer length.</param>
+        /// <returns>The copied buffer, or null when no data is present.</returns>
+        private static byte[] CopyBuffer(IntPtr data, long length)
+        {
+            if (data == IntPtr.Zero || length <= 0)
+            {
+                return null;
+            }
+
+            var buffer = new byte[checked((int)length)];
+            Marshal.Copy(data, buffer, 0, buffer.Length);
+            return buffer;
+        }
+
+        /// <summary>
         /// Ensure media type is video or VBSS.
         /// </summary>
         /// <param name="mediaType">Media type to validate.</param>
@@ -180,10 +232,111 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
         /// </param>
         private void OnAudioMediaReceived(object sender, AudioMediaReceivedEventArgs e)
         {
-            this.GraphLogger.Info($"Received Audio: [VideoMediaReceivedEventArgs(Data=<{e.Buffer.Data.ToString()}>, Length={e.Buffer.Length}, Timestamp={e.Buffer.Timestamp})]");
+            try
+            {
+                if (!this.audioBlobSink.IsEnabled)
+                {
+                    return;
+                }
 
-            // TBD: Policy Recording bots can record the Audio here
-            e.Buffer.Dispose();
+                this.PublishIdentifiedAudioBlobs(e.Buffer);
+            }
+            catch (Exception ex)
+            {
+                this.GraphLogger.Error(ex, "Failed to process received audio buffer.");
+            }
+            finally
+            {
+                e.Buffer.Dispose();
+            }
+        }
+
+        /// <summary>
+        /// Publishes identity-enriched audio blobs from a received media buffer.
+        /// </summary>
+        /// <param name="audioBuffer">The received audio buffer.</param>
+        private void PublishIdentifiedAudioBlobs(AudioMediaBuffer audioBuffer)
+        {
+            var callId = this.callHandler.Call.Id;
+            var receivedAtUtc = DateTimeOffset.UtcNow;
+            var audioFormat = audioBuffer.AudioFormat.ToString();
+            var unmixedAudioBuffers = audioBuffer.UnmixedAudioBuffers;
+
+            if (unmixedAudioBuffers != null)
+            {
+                foreach (var unmixedBuffer in unmixedAudioBuffers)
+                {
+                    var mediaSourceId = unmixedBuffer.ActiveSpeakerId;
+                    var sequenceNumber = this.GetNextSequenceNumber(mediaSourceId);
+                    var streamId = CreateStreamId(callId, mediaSourceId.ToString());
+                    if (!this.audioBlobSink.CanAccept)
+                    {
+                        continue;
+                    }
+
+                    var identity = this.callHandler.GetParticipantIdentityMetadata(mediaSourceId);
+
+                    this.audioBlobSink.TryPublish(new IdentifiedAudioBlob
+                    {
+                        BlobId = CreateBlobId(streamId, sequenceNumber),
+                        CallId = callId,
+                        StreamId = streamId,
+                        SequenceNumber = sequenceNumber,
+                        ReceivedAtUtc = receivedAtUtc,
+                        MediaSourceId = mediaSourceId.ToString(),
+                        MediaTimestamp = audioBuffer.Timestamp,
+                        OriginalSenderTimestamp = unmixedBuffer.OriginalSenderTimestamp,
+                        IsMixed = false,
+                        IsSilence = audioBuffer.IsSilence,
+                        Length = unmixedBuffer.Length,
+                        AudioFormat = audioFormat,
+                        Buffer = CopyBuffer(unmixedBuffer.Data, unmixedBuffer.Length),
+                        UserId = identity?.UserId,
+                        DisplayName = identity?.DisplayName,
+                        ParticipantTenantId = identity?.ParticipantTenantId,
+                        ConfiguredOrgId = identity?.ConfiguredOrgId,
+                        IdentityType = identity?.IdentityType,
+                        Identity = identity,
+                    });
+                }
+            }
+
+            if (this.audioBlobSink.IncludeMixedAudioBuffer)
+            {
+                var mediaSourceId = "mixed";
+                var sequenceNumber = Interlocked.Increment(ref this.mixedAudioSequenceNumber);
+                var streamId = CreateStreamId(callId, mediaSourceId);
+                if (!this.audioBlobSink.CanAccept)
+                {
+                    return;
+                }
+
+                this.audioBlobSink.TryPublish(new IdentifiedAudioBlob
+                {
+                    BlobId = CreateBlobId(streamId, sequenceNumber),
+                    CallId = callId,
+                    StreamId = streamId,
+                    SequenceNumber = sequenceNumber,
+                    ReceivedAtUtc = receivedAtUtc,
+                    MediaSourceId = mediaSourceId,
+                    MediaTimestamp = audioBuffer.Timestamp,
+                    IsMixed = true,
+                    IsSilence = audioBuffer.IsSilence,
+                    Length = audioBuffer.Length,
+                    AudioFormat = audioFormat,
+                    Buffer = CopyBuffer(audioBuffer.Data, audioBuffer.Length),
+                });
+            }
+        }
+
+        /// <summary>
+        /// Gets the next audio sequence number for the media source.
+        /// </summary>
+        /// <param name="mediaSourceId">The media source identifier.</param>
+        /// <returns>The next sequence number.</returns>
+        private long GetNextSequenceNumber(uint mediaSourceId)
+        {
+            return this.audioSequenceNumbers.AddOrUpdate(mediaSourceId, 1, (key, currentValue) => currentValue + 1);
         }
 
         /// <summary>
@@ -197,7 +350,7 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
         /// </param>
         private void OnVideoMediaReceived(object sender, VideoMediaReceivedEventArgs e)
         {
-            this.GraphLogger.Info($"[{e.SocketId}]: Received Video: [VideoMediaReceivedEventArgs(Data=<{e.Buffer.Data.ToString()}>, Length={e.Buffer.Length}, Timestamp={e.Buffer.Timestamp}, Width={e.Buffer.VideoFormat.Width}, Height={e.Buffer.VideoFormat.Height}, ColorFormat={e.Buffer.VideoFormat.VideoColorFormat}, FrameRate={e.Buffer.VideoFormat.FrameRate})]");
+            this.GraphLogger.Verbose($"[{e.SocketId}]: Received Video: [VideoMediaReceivedEventArgs(Data=<{e.Buffer.Data.ToString()}>, Length={e.Buffer.Length}, Timestamp={e.Buffer.Timestamp}, Width={e.Buffer.VideoFormat.Width}, Height={e.Buffer.VideoFormat.Height}, ColorFormat={e.Buffer.VideoFormat.VideoColorFormat}, FrameRate={e.Buffer.VideoFormat.FrameRate})]");
 
             // TBD: Policy Recording bots can record the Video here
             e.Buffer.Dispose();
@@ -214,7 +367,7 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
         /// </param>
         private void OnVbssMediaReceived(object sender, VideoMediaReceivedEventArgs e)
         {
-            this.GraphLogger.Info($"[{e.SocketId}]: Received VBSS: [VideoMediaReceivedEventArgs(Data=<{e.Buffer.Data.ToString()}>, Length={e.Buffer.Length}, Timestamp={e.Buffer.Timestamp}, Width={e.Buffer.VideoFormat.Width}, Height={e.Buffer.VideoFormat.Height}, ColorFormat={e.Buffer.VideoFormat.VideoColorFormat}, FrameRate={e.Buffer.VideoFormat.FrameRate})]");
+            this.GraphLogger.Verbose($"[{e.SocketId}]: Received VBSS: [VideoMediaReceivedEventArgs(Data=<{e.Buffer.Data.ToString()}>, Length={e.Buffer.Length}, Timestamp={e.Buffer.Timestamp}, Width={e.Buffer.VideoFormat.Width}, Height={e.Buffer.VideoFormat.Height}, ColorFormat={e.Buffer.VideoFormat.VideoColorFormat}, FrameRate={e.Buffer.VideoFormat.FrameRate})]");
 
             // TBD: Policy Recording bots can record the VBSS here
             e.Buffer.Dispose();

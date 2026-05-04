@@ -29,6 +29,11 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
     internal class Bot : IDisposable
     {
         /// <summary>
+        /// The service configuration.
+        /// </summary>
+        private IConfiguration configuration;
+
+        /// <summary>
         /// Gets the instance of the bot.
         /// </summary>
         public static Bot Instance { get; } = new Bot();
@@ -74,6 +79,7 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
 
             this.Logger = logger;
             this.Observer = new SampleObserver(logger);
+            this.configuration = service.Configuration;
 
             var name = this.GetType().Assembly.GetName().Name;
             var builder = new CommunicationsClientBuilder(
@@ -228,7 +234,7 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
         {
             foreach (var call in args.AddedResources)
             {
-                var callHandler = new CallHandler(call);
+                var callHandler = new CallHandler(call, this.configuration?.HomeTenantId);
                 this.CallHandlers[call.Id] = callHandler;
             }
 
