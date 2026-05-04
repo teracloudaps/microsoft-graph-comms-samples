@@ -170,6 +170,46 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
         }
 
         /// <summary>
+        /// Creates a stable stream identifier from the call and media source identifiers.
+        /// </summary>
+        /// <param name="callId">The call identifier.</param>
+        /// <param name="mediaSourceId">The media source identifier.</param>
+        /// <returns>The stream identifier.</returns>
+        private static string CreateStreamId(string callId, string mediaSourceId)
+        {
+            return $"{callId}:{mediaSourceId}";
+        }
+
+        /// <summary>
+        /// Creates a stable blob identifier from the stream identifier and sequence number.
+        /// </summary>
+        /// <param name="streamId">The stream identifier.</param>
+        /// <param name="sequenceNumber">The stream sequence number.</param>
+        /// <returns>The blob identifier.</returns>
+        private static string CreateBlobId(string streamId, long sequenceNumber)
+        {
+            return $"{streamId}:{sequenceNumber:D20}";
+        }
+
+        /// <summary>
+        /// Copies unmanaged media buffer data into managed memory.
+        /// </summary>
+        /// <param name="data">The unmanaged buffer pointer.</param>
+        /// <param name="length">The buffer length.</param>
+        /// <returns>The copied buffer, or null when no data is present.</returns>
+        private static byte[] CopyBuffer(IntPtr data, long length)
+        {
+            if (data == IntPtr.Zero || length <= 0)
+            {
+                return null;
+            }
+
+            var buffer = new byte[checked((int)length)];
+            Marshal.Copy(data, buffer, 0, buffer.Length);
+            return buffer;
+        }
+
+        /// <summary>
         /// Ensure media type is video or VBSS.
         /// </summary>
         /// <param name="mediaType">Media type to validate.</param>
@@ -234,6 +274,8 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
                         continue;
                     }
 
+                    var identity = this.callHandler.GetParticipantIdentityMetadata(mediaSourceId);
+
                     this.audioBlobSink.TryPublish(new IdentifiedAudioBlob
                     {
                         BlobId = CreateBlobId(streamId, sequenceNumber),
@@ -249,7 +291,12 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
                         Length = unmixedBuffer.Length,
                         AudioFormat = audioFormat,
                         Buffer = CopyBuffer(unmixedBuffer.Data, unmixedBuffer.Length),
-                        Identity = this.callHandler.GetParticipantIdentityMetadata(mediaSourceId),
+                        UserId = identity?.UserId,
+                        DisplayName = identity?.DisplayName,
+                        ParticipantTenantId = identity?.ParticipantTenantId,
+                        ConfiguredOrgId = identity?.ConfiguredOrgId,
+                        IdentityType = identity?.IdentityType,
+                        Identity = identity,
                     });
                 }
             }
@@ -282,37 +329,14 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
             }
         }
 
+        /// <summary>
+        /// Gets the next audio sequence number for the media source.
+        /// </summary>
+        /// <param name="mediaSourceId">The media source identifier.</param>
+        /// <returns>The next sequence number.</returns>
         private long GetNextSequenceNumber(uint mediaSourceId)
         {
             return this.audioSequenceNumbers.AddOrUpdate(mediaSourceId, 1, (key, currentValue) => currentValue + 1);
-        }
-
-        private static string CreateStreamId(string callId, string mediaSourceId)
-        {
-            return $"{callId}:{mediaSourceId}";
-        }
-
-        private static string CreateBlobId(string streamId, long sequenceNumber)
-        {
-            return $"{streamId}:{sequenceNumber:D20}";
-        }
-
-        /// <summary>
-        /// Copies unmanaged media buffer data into managed memory.
-        /// </summary>
-        /// <param name="data">The unmanaged buffer pointer.</param>
-        /// <param name="length">The buffer length.</param>
-        /// <returns>The copied buffer, or null when no data is present.</returns>
-        private static byte[] CopyBuffer(IntPtr data, long length)
-        {
-            if (data == IntPtr.Zero || length <= 0)
-            {
-                return null;
-            }
-
-            var buffer = new byte[checked((int)length)];
-            Marshal.Copy(data, buffer, 0, buffer.Length);
-            return buffer;
         }
 
         /// <summary>

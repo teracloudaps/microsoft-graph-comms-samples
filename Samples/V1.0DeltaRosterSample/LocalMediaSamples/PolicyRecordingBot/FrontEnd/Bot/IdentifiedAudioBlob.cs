@@ -78,27 +78,6 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
         public byte[] Buffer { get; set; }
 
         /// <summary>
-        /// Gets or sets the participant identity metadata.
-        /// </summary>
-        public ParticipantIdentityMetadata Identity { get; set; }
-    }
-
-    /// <summary>
-    /// Participant identity metadata emitted with audio blobs.
-    /// </summary>
-    public class ParticipantIdentityMetadata
-    {
-        /// <summary>
-        /// Gets or sets the Graph participant identifier.
-        /// </summary>
-        public string ParticipantId { get; set; }
-
-        /// <summary>
-        /// Gets or sets the media source identifier used to map audio to the participant.
-        /// </summary>
-        public string MediaSourceId { get; set; }
-
-        /// <summary>
         /// Gets or sets the participant user identifier, when available.
         /// </summary>
         public string UserId { get; set; }
@@ -122,63 +101,11 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
         /// Gets or sets the identity type, such as User, AdditionalData, or Unknown.
         /// </summary>
         public string IdentityType { get; set; }
+
+        /// <summary>
+        /// Gets or sets the participant identity metadata.
+        /// </summary>
+        public ParticipantIdentityMetadata Identity { get; set; }
     }
 
-    /// <summary>
-    /// Receives identity-enriched audio blobs.
-    /// </summary>
-    public interface IAudioBlobSink
-    {
-        /// <summary>
-        /// Gets a value indicating whether audio blobs should be built and published.
-        /// </summary>
-        bool IsEnabled { get; }
-
-        /// <summary>
-        /// Gets a value indicating whether the mixed audio buffer should be copied into the payload.
-        /// </summary>
-        bool IncludeMixedAudioBuffer { get; }
-
-        /// <summary>
-        /// Gets a value indicating whether the sink can currently accept another blob without blocking.
-        /// </summary>
-        bool CanAccept { get; }
-
-        /// <summary>
-        /// Tries to publish an audio blob without blocking the media callback.
-        /// </summary>
-        /// <param name="audioBlob">The audio blob to publish.</param>
-        /// <returns>True when the blob was accepted; otherwise, false.</returns>
-        bool TryPublish(IdentifiedAudioBlob audioBlob);
-    }
-
-    /// <summary>
-    /// Default sink used when no downstream publisher is configured.
-    /// </summary>
-    internal class NullAudioBlobSink : IAudioBlobSink
-    {
-        /// <summary>
-        /// Gets the shared null sink instance.
-        /// </summary>
-        public static readonly IAudioBlobSink Instance = new NullAudioBlobSink();
-
-        /// <inheritdoc/>
-        public bool IsEnabled => false;
-
-        /// <inheritdoc/>
-        public bool IncludeMixedAudioBuffer => false;
-
-        /// <inheritdoc/>
-        public bool CanAccept => false;
-
-        private NullAudioBlobSink()
-        {
-        }
-
-        /// <inheritdoc/>
-        public bool TryPublish(IdentifiedAudioBlob audioBlob)
-        {
-            return true;
-        }
-    }
 }

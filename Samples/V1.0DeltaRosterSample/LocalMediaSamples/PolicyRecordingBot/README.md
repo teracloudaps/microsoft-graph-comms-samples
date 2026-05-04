@@ -11,7 +11,7 @@ The Policy Recording bot sample guides you through building, deploying and testi
 
 ## Participant Identity Metadata
 
-When an audio sink is enabled, received audio is published as one `IdentifiedAudioBlob` per unmixed participant buffer before the media buffer is disposed. Each blob includes a stable `StreamId`, monotonically increasing `SequenceNumber`, unique `BlobId`, media timestamps, copied audio bytes, and `ParticipantIdentityMetadata` with available participant id, user id, display name, participant tenant id, identity type, and configured org/tenant id. The default sink is disabled, so the sample does not copy audio until a real sink is supplied.
+When an audio sink is enabled, received audio is published as one `IdentifiedAudioBlob` per unmixed participant buffer before the media buffer is disposed. Each blob includes a stable `StreamId`, monotonically increasing `SequenceNumber`, unique `BlobId`, media timestamps, copied audio bytes, and flattened participant identity fields (`UserId`, `DisplayName`, `ParticipantTenantId`, `ConfiguredOrgId`, and `IdentityType`) for the Teracloud Streams `TeamsBotOp` metadata parser. The full `ParticipantIdentityMetadata` object is also included for richer consumers. The default sink is disabled, so the sample does not copy audio until a real sink is supplied.
 
 For Teracloud Streams and STT workflows, use `StreamId` as the per-call/per-speaker partition key and `SequenceNumber` to detect gaps or restore ordering. Live transcript updates should keep the blob metadata through STT, and final utterance enrichment should persist the stream id plus first/last sequence numbers that produced the final utterance.
 

@@ -29,6 +29,11 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
     internal class Bot : IDisposable
     {
         /// <summary>
+        /// The service configuration.
+        /// </summary>
+        private IConfiguration configuration;
+
+        /// <summary>
         /// Gets the instance of the bot.
         /// </summary>
         public static Bot Instance { get; } = new Bot();
@@ -52,8 +57,6 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
         /// Gets the entry point for stateful bot.
         /// </summary>
         public ICommunicationsClient Client { get; private set; }
-
-        private IConfiguration configuration;
 
         /// <inheritdoc />
         public void Dispose()

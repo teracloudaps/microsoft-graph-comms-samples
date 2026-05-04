@@ -98,6 +98,65 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
         /// </summary>
         public BotMediaStream BotMediaStream { get; private set; }
 
+        /// <summary>
+        /// Tries to get a usable participant identity.
+        /// </summary>
+        /// <param name="participant">The participant.</param>
+        /// <param name="identityType">The resolved identity type.</param>
+        /// <returns>The identity, if available.</returns>
+        internal static Identity TryGetParticipantIdentity(IParticipant participant, out string identityType)
+        {
+            identityType = "Unknown";
+
+            var identitySet = participant?.Resource?.Info?.Identity;
+            if (identitySet?.User != null)
+            {
+                identityType = "User";
+                return identitySet.User;
+            }
+
+            if (identitySet?.AdditionalData != null)
+            {
+                foreach (var identityData in identitySet.AdditionalData)
+                {
+                    if (string.Equals(identityData.Key, "applicationInstance", StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+
+                    if (identityData.Value is Identity identity)
+                    {
+                        identityType = $"AdditionalData:{identityData.Key}";
+                        return identity;
+                    }
+                }
+            }
+
+            return null;
+        }
+
+        /// <summary>
+        /// Gets the participant with the corresponding MSI.
+        /// </summary>
+        /// <param name="msi">Media stream id.</param>
+        /// <returns>
+        /// The <see cref="IParticipant"/>.
+        /// </returns>
+        internal IParticipant GetParticipantFromMSI(uint msi)
+        {
+            return this.Call.Participants.SingleOrDefault(x => x.Resource.IsInLobby == false && x.Resource.MediaStreams.Any(y => y.SourceId == msi.ToString()));
+        }
+
+        /// <summary>
+        /// Gets participant identity metadata for the specified media source id.
+        /// </summary>
+        /// <param name="mediaSourceId">The media source id.</param>
+        /// <returns>Participant identity metadata.</returns>
+        internal ParticipantIdentityMetadata GetParticipantIdentityMetadata(uint mediaSourceId)
+        {
+            return this.mediaSourceIdentityMetadata.GetOrAdd(mediaSourceId, this.CreateParticipantIdentityMetadata);
+        }
+
         /// <inheritdoc/>
         protected override Task HeartbeatAsync(ElapsedEventArgs args)
         {
@@ -123,6 +182,41 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
             this.recordingStatusFlipTimer.Enabled = false;
             this.recordingStatusFlipTimer.Elapsed -= this.OnRecordingStatusFlip;
             this.BotMediaStream.Dispose();
+        }
+
+        /// <summary>
+        /// Gets the tenant id from an identity when the SDK exposes it directly or in additional data.
+        /// </summary>
+        /// <param name="identity">The identity.</param>
+        /// <returns>The tenant id, when available.</returns>
+        private static string GetTenantId(Identity identity)
+        {
+            if (identity == null)
+            {
+                return null;
+            }
+
+            var tenantProperty = identity.GetType().GetProperty("TenantId");
+            if (tenantProperty?.GetValue(identity) is string tenantId && !string.IsNullOrWhiteSpace(tenantId))
+            {
+                return tenantId;
+            }
+
+            if (identity.AdditionalData == null)
+            {
+                return null;
+            }
+
+            foreach (var additionalData in identity.AdditionalData)
+            {
+                if (string.Equals(additionalData.Key, "tenantId", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(additionalData.Key, "tid", StringComparison.OrdinalIgnoreCase))
+                {
+                    return additionalData.Value?.ToString();
+                }
+            }
+
+            return null;
         }
 
         /// <summary>
@@ -398,31 +492,8 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
         }
 
         /// <summary>
-        /// Gets the participant with the corresponding MSI.
-        /// </summary>
-        /// <param name="msi">media stream id.</param>
-        /// <returns>
-        /// The <see cref="IParticipant"/>.
-        /// </returns>
-        internal IParticipant GetParticipantFromMSI(uint msi)
-        {
-            return this.Call.Participants.SingleOrDefault(x => x.Resource.IsInLobby == false && x.Resource.MediaStreams.Any(y => y.SourceId == msi.ToString()));
-        }
-
-        /// <summary>
         /// Gets participant identity metadata for the specified media source id.
         /// </summary>
-        /// <param name="mediaSourceId">The media source id.</param>
-        /// <returns>Participant identity metadata.</returns>
-        internal ParticipantIdentityMetadata GetParticipantIdentityMetadata(uint mediaSourceId)
-        {
-            return this.mediaSourceIdentityMetadata.GetOrAdd(mediaSourceId, this.CreateParticipantIdentityMetadata);
-        }
-
-        /// <summary>
-        /// Gets participant identity metadata for the specified media source id.
-        /// </summary>
-        /// <param name="participant">The participant.</param>
         /// <param name="mediaSourceId">The media source id.</param>
         /// <returns>Participant identity metadata.</returns>
         private ParticipantIdentityMetadata CreateParticipantIdentityMetadata(uint mediaSourceId)
@@ -430,6 +501,12 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
             return this.CreateParticipantIdentityMetadata(this.GetParticipantFromMSI(mediaSourceId), mediaSourceId);
         }
 
+        /// <summary>
+        /// Creates participant identity metadata for the specified participant and media source id.
+        /// </summary>
+        /// <param name="participant">The participant.</param>
+        /// <param name="mediaSourceId">The media source id.</param>
+        /// <returns>Participant identity metadata.</returns>
         private ParticipantIdentityMetadata CreateParticipantIdentityMetadata(IParticipant participant, uint mediaSourceId)
         {
             var identity = TryGetParticipantIdentity(participant, out string identityType);
@@ -446,6 +523,10 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
             };
         }
 
+        /// <summary>
+        /// Caches participant identity metadata for each media stream on the participant.
+        /// </summary>
+        /// <param name="participant">The participant.</param>
         private void CacheParticipantMediaStreams(IParticipant participant)
         {
             if (participant?.Resource?.MediaStreams == null)
@@ -462,6 +543,10 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
             }
         }
 
+        /// <summary>
+        /// Removes cached participant identity metadata for each media stream on the participant.
+        /// </summary>
+        /// <param name="participant">The participant.</param>
         private void RemoveParticipantMediaStreams(IParticipant participant)
         {
             if (participant?.Resource?.MediaStreams == null)
@@ -476,78 +561,6 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
                     this.mediaSourceIdentityMetadata.TryRemove(mediaSourceId, out ParticipantIdentityMetadata _);
                 }
             }
-        }
-
-        /// <summary>
-        /// Tries to get a usable participant identity.
-        /// </summary>
-        /// <param name="participant">The participant.</param>
-        /// <param name="identityType">The resolved identity type.</param>
-        /// <returns>The identity, if available.</returns>
-        internal static Identity TryGetParticipantIdentity(IParticipant participant, out string identityType)
-        {
-            identityType = "Unknown";
-
-            var identitySet = participant?.Resource?.Info?.Identity;
-            if (identitySet?.User != null)
-            {
-                identityType = "User";
-                return identitySet.User;
-            }
-
-            if (identitySet?.AdditionalData != null)
-            {
-                foreach (var identityData in identitySet.AdditionalData)
-                {
-                    if (string.Equals(identityData.Key, "applicationInstance", StringComparison.OrdinalIgnoreCase))
-                    {
-                        continue;
-                    }
-
-                    if (identityData.Value is Identity identity)
-                    {
-                        identityType = $"AdditionalData:{identityData.Key}";
-                        return identity;
-                    }
-                }
-            }
-
-            return null;
-        }
-
-        /// <summary>
-        /// Gets the tenant id from an identity when the SDK exposes it directly or in additional data.
-        /// </summary>
-        /// <param name="identity">The identity.</param>
-        /// <returns>The tenant id, when available.</returns>
-        private static string GetTenantId(Identity identity)
-        {
-            if (identity == null)
-            {
-                return null;
-            }
-
-            var tenantProperty = identity.GetType().GetProperty("TenantId");
-            if (tenantProperty?.GetValue(identity) is string tenantId && !string.IsNullOrWhiteSpace(tenantId))
-            {
-                return tenantId;
-            }
-
-            if (identity.AdditionalData == null)
-            {
-                return null;
-            }
-
-            foreach (var additionalData in identity.AdditionalData)
-            {
-                if (string.Equals(additionalData.Key, "tenantId", StringComparison.OrdinalIgnoreCase) ||
-                    string.Equals(additionalData.Key, "tid", StringComparison.OrdinalIgnoreCase))
-                {
-                    return additionalData.Value?.ToString();
-                }
-            }
-
-            return null;
         }
     }
 }
