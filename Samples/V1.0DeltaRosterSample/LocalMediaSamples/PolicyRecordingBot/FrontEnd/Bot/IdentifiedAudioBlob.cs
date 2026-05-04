@@ -107,5 +107,4 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
         /// </summary>
         public ParticipantIdentityMetadata Identity { get; set; }
     }
-
 }
