@@ -1,4 +1,4 @@
-﻿// <copyright file="BotMediaStream.cs" company="Microsoft Corporation">
+// <copyright file="BotMediaStream.cs" company="Microsoft Corporation">
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT license.
 // </copyright>
@@ -432,7 +432,7 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
                         this.ReclassifyTrackedParticipantsForOrgTenant();
                     }
 
-                    // If same tenant as org → INTERNAL (not external Teams user)
+                    // If same tenant as org, classify as internal for metadata.
                     if (!isAgent && !string.IsNullOrEmpty(this.orgTenantId) &&
                         participantTenantId != "unknown" && participantTenantId == this.orgTenantId)
                     {
@@ -471,7 +471,7 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
                         {
                             mediaStreamIds.Add(msi);
                             this.msiToParticipantId[msi] = participantId;
-                            Console.WriteLine($"Mapped MSI {msi} → {participantId} ({role})");
+                            Console.WriteLine($"Mapped MSI {msi} to {participantId} ({role})");
                         }
                     }
                 }
@@ -523,7 +523,7 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
                     {
                         if (this.participantsById.TryRemove(kvp.Key, out var evicted))
                         {
-                            Console.WriteLine($"Evicted placeholder '{evicted.DisplayName}' (channel {channelId}) → replaced by '{displayName}'");
+                            Console.WriteLine($"Evicted placeholder '{evicted.DisplayName}' (channel {channelId}); replaced by '{displayName}'");
                             this.SendParticipantMetadata(evicted, "LEAVE");
                         }
                     }
@@ -749,7 +749,7 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
                     return;
                 }
 
-                // ✅ CHECK FOR UNMIXED AUDIO BUFFERS (TRUE PER-SPEAKER AUDIO)
+                // Check for unmixed audio buffers with true per-speaker audio.
                 if (e.Buffer.UnmixedAudioBuffers != null)
                 {
                     try
@@ -766,14 +766,14 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
                     }
                 }
 
-                // ✅ HANDLE SILENCE WITH UNMIXED MODE (write to all active tracks)
+                // Handle silence in unmixed mode by writing to all active tracks.
                 if (e.Buffer.IsSilence && this.unmixedAudioEnabled)
                 {
                     this.ProcessSilenceForUnmixedMode(e);
                     return;
                 }
 
-                // ✅ FALLBACK: MIXED AUDIO + DOMINANT SPEAKER (compliance recording mode)
+                // Fall back to mixed audio plus dominant speaker in compliance recording mode.
                 this.ProcessMixedAudio(e);
             }
             catch (Exception ex)
