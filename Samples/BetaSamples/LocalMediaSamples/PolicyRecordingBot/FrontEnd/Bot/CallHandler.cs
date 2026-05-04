@@ -1,9 +1,4 @@
-﻿// <copyright file="CallHandler.cs" company="Microsoft Corporation">
-// Copyright (c) Microsoft Corporation. All rights reserved.
-// Licensed under the MIT license.
-// </copyright>
-
-namespace Sample.PolicyRecordingBot.FrontEnd.Bot
+﻿namespace Sample.PolicyRecordingBot.FrontEnd.Bot
 {
     using System;
     using System.Collections.Concurrent;
@@ -19,157 +14,145 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
     using Microsoft.Graph.Communications.Resources;
     using Microsoft.Skype.Bots.Media;
     using Sample.Common;
+
     using RejectReason = Microsoft.Graph.Communications.Common.RejectReason;
 
-    /// <summary>
-    /// Call Handler Logic.
-    /// </summary>
     internal class CallHandler : HeartbeatHandler
     {
-        /// <summary>
-        /// MSI when there is no dominant speaker.
-        /// </summary>
         public const uint DominantSpeakerNone = DominantSpeakerChangedEventArgs.None;
 
-        // hashSet of the available sockets
         private readonly HashSet<uint> availableSocketIds = new HashSet<uint>();
-
-        // this is an LRU cache with the MSI values, we update this Cache with the dominant speaker events
-        // this way we can make sure that the muliview sockets are subscribed to the active (speaking) participants
         private readonly LRUCache currentVideoSubscriptions = new LRUCache(SampleConstants.NumberOfMultiviewSockets + 1);
-
         private readonly object subscriptionLock = new object();
-
-        // This dictionnary helps maintaining a mapping of the sockets subscriptions
         private readonly ConcurrentDictionary<uint, uint> msiToSocketIdMapping = new ConcurrentDictionary<uint, uint>();
 
-        private readonly ConcurrentDictionary<uint, ParticipantIdentityMetadata> mediaSourceIdentityMetadata = new ConcurrentDictionary<uint, ParticipantIdentityMetadata>();
-
-        private readonly Timer recordingStatusFlipTimer;
-
-        private readonly string configuredOrgId;
-
+        // private readonly Timer recordingStatusFlipTimer;
         private int recordingStatusIndex = -1;
-
         private int participantsCount = 0;
 
-        /// <summary>
-        /// Initializes a new instance of the <see cref="CallHandler"/> class.
-        /// </summary>
-        /// <param name="statefulCall">The stateful call.</param>
-        /// <param name="configuredOrgId">The configured org or tenant identifier emitted with participant metadata.</param>
-        /// <param name="audioBlobSink">The audio blob sink.</param>
-        public CallHandler(ICall statefulCall, string configuredOrgId, IAudioBlobSink audioBlobSink = null)
-            : base(TimeSpan.FromMinutes(10), statefulCall?.GraphLogger)
+        public CallHandler(
+            ICall statefulCall,
+            string configuredOrgId = null,
+            string agentUserId = null,
+            string agentDisplayName = null)
+            : base(TimeSpan.FromMinutes(1), statefulCall?.GraphLogger)
         {
-            this.configuredOrgId = configuredOrgId;
+            var effectiveAgentUserId = string.IsNullOrWhiteSpace(agentUserId)
+                ? (Environment.GetEnvironmentVariable("AGENT_USER_ID") ?? string.Empty).Trim()
+                : agentUserId.Trim();
+
+            var effectiveAgentDisplayName = string.IsNullOrWhiteSpace(agentDisplayName)
+                ? (Environment.GetEnvironmentVariable("AGENT_DISPLAY_NAME") ?? string.Empty).Trim()
+                : agentDisplayName.Trim();
+
             this.Call = statefulCall;
             this.Call.OnUpdated += this.CallOnUpdated;
 
-            // subscribe to dominant speaker event on the audioSocket
-            var audioSocket = this.Call.GetLocalMediaSession().AudioSocket;
-            audioSocket.DominantSpeakerChanged += this.OnDominantSpeakerChanged;
-
-            // susbscribe to the participants updates, this will inform the bot if a particpant left/joined the conference
             this.Call.Participants.OnUpdated += this.ParticipantsOnUpdated;
             this.Call.ParticipantLeftHandler += this.ParticipantLeft;
             this.Call.ParticipantJoiningHandler += this.ParticipantJoining;
 
-            // attach the botMediaStream
-            this.BotMediaStream = new BotMediaStream(this.Call.GetLocalMediaSession(), this, this.GraphLogger, audioBlobSink);
-
-            // initialize the timer
-            var timer = new Timer(1000 * 60 * 5); // every 5 minutes
-            timer.AutoReset = true;
-            timer.Elapsed += this.OnRecordingStatusFlip;
-            this.recordingStatusFlipTimer = timer;
-
-            // Count the first answer
-            this.participantsCount = 1;
-        }
-
-        /// <summary>
-        /// Gets the call.
-        /// </summary>
-        public ICall Call { get; }
-
-        /// <summary>
-        /// Gets the bot media stream.
-        /// </summary>
-        public BotMediaStream BotMediaStream { get; private set; }
-
-        /// <summary>
-        /// Tries to get a usable participant identity.
-        /// </summary>
-        /// <param name="participant">The participant.</param>
-        /// <param name="identityType">The resolved identity type.</param>
-        /// <returns>The identity, if available.</returns>
-        internal static Identity TryGetParticipantIdentity(IParticipant participant, out string identityType)
-        {
-            identityType = "Unknown";
-
-            var identitySet = participant?.Resource?.Info?.Identity;
-            if (identitySet?.User != null)
+            Console.WriteLine($"CallHandler for agent: {effectiveAgentDisplayName} ({effectiveAgentUserId})");
+            if (string.IsNullOrWhiteSpace(effectiveAgentUserId))
             {
-                identityType = "User";
-                return identitySet.User;
+                Console.WriteLine(" AGENT_USER_ID resolved to empty. Agent may be classified as CALLER.");
             }
 
-            if (identitySet?.AdditionalData != null)
+            if (this.Call.Resource != null)
             {
-                foreach (var identityData in identitySet.AdditionalData)
+                Console.WriteLine($"   Call.Resource.State: {this.Call.Resource.State}");
+                Console.WriteLine($"   Call.Resource.Direction: {this.Call.Resource.Direction}");
+                Console.WriteLine($"   Call.Resource.Source: {this.Call.Resource.Source?.Identity?.User?.DisplayName ?? "N/A"}");
+
+                if (this.Call.Resource.Targets != null)
                 {
-                    if (string.Equals(identityData.Key, "applicationInstance", StringComparison.OrdinalIgnoreCase))
+                    Console.WriteLine($"   Call.Resource.Targets.Count: {this.Call.Resource.Targets.Count}");
+                }
+            }
+
+            Console.WriteLine($"   Call.Participants: {(this.Call.Participants != null ? "NOT NULL" : "NULL")}");
+
+            if (this.Call.Participants != null)
+            {
+                Console.WriteLine($"   Call.Participants.Count: {this.Call.Participants.Count}");
+                Console.WriteLine($"   Call.Participants is ICollection: {this.Call.Participants is System.Collections.ICollection}");
+
+                // Try to iterate even if count is 0
+                try
+                {
+                    int enumCount = 0;
+                    foreach (var p in this.Call.Participants)
                     {
-                        continue;
+                        enumCount++;
                     }
 
-                    if (identityData.Value is Identity identity)
+                    Console.WriteLine($"   Actually enumerated: {enumCount} participants");
+                }
+                catch (Exception enumEx)
+                {
+                    Console.WriteLine($"     Failed to enumerate participants: {enumEx.Message}");
+                    Console.WriteLine($"      Exception Type: {enumEx.GetType().Name}");
+                }
+            }
+
+            var mediaSession = this.Call.GetLocalMediaSession();
+
+            // Create BotMediaStream
+            this.BotMediaStream = new BotMediaStream(
+                mediaSession,
+                this.GraphLogger,
+                this.Call,
+                effectiveAgentUserId,
+                effectiveAgentDisplayName,
+                configuredOrgId);
+
+            if (this.Call.Participants.Count > 0)
+            {
+                Console.WriteLine($" Found {this.Call.Participants.Count} existing participant(s)");
+                foreach (var participant in this.Call.Participants)
+                {
+                    var displayName = participant.Resource?.Info?.Identity?.User?.DisplayName ??
+                                    participant.Resource?.Info?.Identity?.Application?.DisplayName ??
+                                    "Unknown";
+                    Console.WriteLine($" Participant: {displayName}");
+
+                    this.BotMediaStream.RegisterParticipantFromCallHandler(participant);
+
+                    // Subscribe for updates
+                    var participantDetails = participant.Resource?.Info?.Identity?.User;
+                    if (participantDetails != null)
                     {
-                        identityType = $"AdditionalData:{identityData.Key}";
-                        return identity;
+                        participant.OnUpdated += this.OnParticipantUpdated;
+                        this.SubscribeToParticipantVideo(participant, forceSubscribe: false);
                     }
                 }
             }
 
-            return null;
+            for (uint i = 0; i < SampleConstants.NumberOfMultiviewSockets; i++)
+            {
+                this.availableSocketIds.Add(i);
+            }
+
+            // DISABLED: Demo/test timer that cycles recording status - not needed for production
+            // var timer = new Timer(1000 * 60 * 5);
+            // timer.AutoReset = true;
+            // timer.Elapsed += this.OnRecordingStatusFlip;
+            // this.recordingStatusFlipTimer = timer;
         }
 
-        /// <summary>
-        /// Gets the participant with the corresponding MSI.
-        /// </summary>
-        /// <param name="msi">Media stream id.</param>
-        /// <returns>
-        /// The <see cref="IParticipant"/>.
-        /// </returns>
-        internal IParticipant GetParticipantFromMSI(uint msi)
-        {
-            return this.Call.Participants.SingleOrDefault(x => x.Resource.IsInLobby == false && x.Resource.MediaStreams.Any(y => y.SourceId == msi.ToString()));
-        }
+        public ICall Call { get; }
 
-        /// <summary>
-        /// Gets participant identity metadata for the specified media source id.
-        /// </summary>
-        /// <param name="mediaSourceId">The media source id.</param>
-        /// <returns>Participant identity metadata.</returns>
-        internal ParticipantIdentityMetadata GetParticipantIdentityMetadata(uint mediaSourceId)
-        {
-            return this.mediaSourceIdentityMetadata.GetOrAdd(mediaSourceId, this.CreateParticipantIdentityMetadata);
-        }
+        public BotMediaStream BotMediaStream { get; private set; }
 
-        /// <inheritdoc/>
         protected override Task HeartbeatAsync(ElapsedEventArgs args)
         {
+            Console.WriteLine($"Sending keepalive for call {this.Call.Id}");
             return this.Call.KeepAliveAsync();
         }
 
-        /// <inheritdoc />
         protected override void Dispose(bool disposing)
         {
             base.Dispose(disposing);
-
-            var audioSocket = this.Call.GetLocalMediaSession().AudioSocket;
-            audioSocket.DominantSpeakerChanged -= this.OnDominantSpeakerChanged;
 
             this.Call.OnUpdated -= this.CallOnUpdated;
             this.Call.Participants.OnUpdated -= this.ParticipantsOnUpdated;
@@ -179,51 +162,15 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
                 participant.OnUpdated -= this.OnParticipantUpdated;
             }
 
-            this.recordingStatusFlipTimer.Enabled = false;
-            this.recordingStatusFlipTimer.Elapsed -= this.OnRecordingStatusFlip;
+            // Only cleanup if timer was initialized
+           // if (this.recordingStatusFlipTimer != null)
+           // {
+           //     this.recordingStatusFlipTimer.Enabled = false;
+           //     this.recordingStatusFlipTimer.Elapsed -= this.OnRecordingStatusFlip;
+           // }
             this.BotMediaStream.Dispose();
         }
 
-        /// <summary>
-        /// Gets the tenant id from an identity when the SDK exposes it directly or in additional data.
-        /// </summary>
-        /// <param name="identity">The identity.</param>
-        /// <returns>The tenant id, when available.</returns>
-        private static string GetTenantId(Identity identity)
-        {
-            if (identity == null)
-            {
-                return null;
-            }
-
-            var tenantProperty = identity.GetType().GetProperty("TenantId");
-            if (tenantProperty?.GetValue(identity) is string tenantId && !string.IsNullOrWhiteSpace(tenantId))
-            {
-                return tenantId;
-            }
-
-            if (identity.AdditionalData == null)
-            {
-                return null;
-            }
-
-            foreach (var additionalData in identity.AdditionalData)
-            {
-                if (string.Equals(additionalData.Key, "tenantId", StringComparison.OrdinalIgnoreCase) ||
-                    string.Equals(additionalData.Key, "tid", StringComparison.OrdinalIgnoreCase))
-                {
-                    return additionalData.Value?.ToString();
-                }
-            }
-
-            return null;
-        }
-
-        /// <summary>
-        /// Called when recording status flip timer fires.
-        /// </summary>
-        /// <param name="source">The source.</param>
-        /// <param name="e">The <see cref="ElapsedEventArgs" /> instance containing the event data.</param>
         private void OnRecordingStatusFlip(object source, ElapsedEventArgs e)
         {
             _ = Task.Run(async () =>
@@ -233,7 +180,6 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
                 if (recordingIndex >= recordingStatus.Length)
                 {
                     var recordedParticipantId = this.Call.Resource.IncomingContext.ObservedParticipantId;
-
                     this.GraphLogger.Warn($"We've rolled through all the status'... removing participant {recordedParticipantId}");
                     var recordedParticipant = this.Call.Participants[recordedParticipantId];
                     await recordedParticipant.DeleteAsync().ConfigureAwait(false);
@@ -241,16 +187,11 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
                 }
 
                 var newStatus = recordingStatus[recordingIndex];
-
                 this.GraphLogger.Info($"Flipping recording status to {newStatus}");
 
                 try
                 {
-                    // NOTE: if your implementation supports stopping the recording during the call, you can call the same method above with RecordingStatus.NotRecording
-                    await this.Call
-                        .UpdateRecordingStatusAsync(newStatus)
-                        .ConfigureAwait(false);
-
+                    await this.Call.UpdateRecordingStatusAsync(newStatus).ConfigureAwait(false);
                     this.recordingStatusIndex = recordingIndex;
                 }
                 catch (Exception exc)
@@ -260,114 +201,81 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
             }).ForgetAndLogExceptionAsync(this.GraphLogger);
         }
 
-        /// <summary>
-        /// Event fired when the call has been updated.
-        /// </summary>
-        /// <param name="sender">The call.</param>
-        /// <param name="e">The event args containing call changes.</param>
         private void CallOnUpdated(ICall sender, ResourceEventArgs<Call> e)
         {
-            if (e.OldResource.State != e.NewResource.State && e.NewResource.State == CallState.Established)
-            {
-                // Call is established. We should start receiving Audio, we can inform clients that we have started recording.
-                this.OnRecordingStatusFlip(sender, null);
+            this.GraphLogger.Info($"Call status updated to {e.NewResource.State} with ResultInfo at {e.NewResource.ResultInfo?.Code}");
 
-                // for testing purposes, flip the recording status automatically at intervals
-                this.recordingStatusFlipTimer.Enabled = true;
+            if (e.OldResource.State != e.NewResource.State)
+            {
+                this.GraphLogger.Info($"Call state changed from {e.OldResource.State} to {e.NewResource.State}");
             }
         }
 
-        /// <summary>
-        /// Event fired when the participants collection has been updated.
-        /// </summary>
-        /// <param name="sender">Participants collection.</param>
-        /// <param name="args">Event args containing added and removed participants.</param>
         private void ParticipantsOnUpdated(IParticipantCollection sender, CollectionEventArgs<IParticipant> args)
         {
             foreach (var participant in args.AddedResources)
             {
-                var participantDetails = TryGetParticipantIdentity(participant, out string _);
+                var participantDetails = participant.Resource.Info.Identity.User;
+                var displayName = participantDetails?.DisplayName ??
+                                 participant.Resource?.Info?.Identity?.Application?.DisplayName ??
+                                 "Unknown";
+
+                Console.WriteLine($"Participant added: {displayName}");
+
+                this.BotMediaStream?.RegisterParticipantFromCallHandler(participant);
+
                 if (participantDetails != null)
                 {
-                    this.CacheParticipantMediaStreams(participant);
-
-                    // subscribe to the participant updates, this will indicate if the user started to share,
-                    // or added another modality
                     participant.OnUpdated += this.OnParticipantUpdated;
-
-                    // the behavior here is to avoid subscribing to a new participant video if the VideoSubscription cache is full
                     this.SubscribeToParticipantVideo(participant, forceSubscribe: false);
                 }
             }
 
             foreach (var participant in args.RemovedResources)
             {
-                var participantDetails = TryGetParticipantIdentity(participant, out string _);
+                var participantDetails = participant.Resource.Info.Identity.User;
+                var displayName = participantDetails?.DisplayName ?? "Unknown";
+                Console.WriteLine($"Participant removed: {displayName}");
+
                 if (participantDetails != null)
                 {
-                    this.RemoveParticipantMediaStreams(participant);
-
-                    // unsubscribe to the participant updates
                     participant.OnUpdated -= this.OnParticipantUpdated;
                     this.UnsubscribeFromParticipantVideo(participant);
                 }
             }
         }
 
-        /// <summary>
-        /// Event fired when a participant associated to the bot has left.
-        /// </summary>
-        /// <param name="call">The call object contains details of the participant left.</param>
-        /// <param name="participantId">The id of the participant that left.</param>
         private void ParticipantLeft(Call call, string participantId)
         {
             this.participantsCount--;
             this.GraphLogger.Info($"[{this.Call.Id}:The participant {participantId} has left with code {call?.ResultInfo?.Code} and subcode {call?.ResultInfo?.Subcode})");
         }
 
-        /// <summary>
-        /// Event fired when a participant associated to the bot has join in same group.
-        /// </summary>
-        /// <param name="call">The call object contains details of the participant joining.</param>
-        /// <returns>The response to participant joining notification.</returns>
         private ParticipantJoiningResponse ParticipantJoining(Call call)
         {
+            Console.WriteLine($"ParticipantJoining event! Current count: {this.participantsCount}");
+
             if (this.participantsCount < SampleConstants.GroupSize)
             {
                 this.participantsCount++;
+                Console.WriteLine($"Accepting participant (new count: {this.participantsCount})");
                 return new AcceptJoinResponse();
             }
             else
             {
+                Console.WriteLine($" Rejecting participant (room full)");
                 return new RejectJoinResponse()
                 {
                     Reason = RejectReason.Busy,
                 };
-
-                /* Use InviteNewBotResponse with url to redirect to another bot instance.
-                return new InviteNewBotResponse()
-                {
-                    InviteUri = "https://redirect.uri",
-                }
-                */
             }
         }
 
-        /// <summary>
-        /// Event fired when a participant is updated.
-        /// </summary>
-        /// <param name="sender">Participant object.</param>
-        /// <param name="args">Event args containing the old values and the new values.</param>
         private void OnParticipantUpdated(IParticipant sender, ResourceEventArgs<Participant> args)
         {
-            this.CacheParticipantMediaStreams(sender);
             this.SubscribeToParticipantVideo(sender, forceSubscribe: false);
         }
 
-        /// <summary>
-        /// Unsubscribe and free up the video socket for the specified participant.
-        /// </summary>
-        /// <param name="participant">Particant to unsubscribe the video.</param>
         private void UnsubscribeFromParticipantVideo(IParticipant participant)
         {
             var participantSendCapableVideoStream = participant.Resource.MediaStreams.Where(x => x.MediaType == Modality.Video &&
@@ -390,19 +298,11 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
             }
         }
 
-        /// <summary>
-        /// Subscribe to video or vbss sharer.
-        /// if we set the flag forceSubscribe to true, the behavior is to subscribe to a video even if there is no available socket left.
-        /// in that case we use the LRU cache to free socket and subscribe to the new MSI.
-        /// </summary>
-        /// <param name="participant">Participant sending the video or VBSS stream.</param>
-        /// <param name="forceSubscribe">If forced, the least recently used video socket is released if no sockets are available.</param>
         private void SubscribeToParticipantVideo(IParticipant participant, bool forceSubscribe = true)
         {
             bool subscribeToVideo = false;
             uint socketId = uint.MaxValue;
 
-            // filter the mediaStreams to see if the participant has a video send
             var participantSendCapableVideoStream = participant.Resource.MediaStreams.Where(x => x.MediaType == Modality.Video &&
                (x.Direction == MediaDirection.SendReceive || x.Direction == MediaDirection.SendOnly)).FirstOrDefault();
             if (participantSendCapableVideoStream != null)
@@ -413,7 +313,6 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
                 {
                     if (this.currentVideoSubscriptions.Count < this.Call.GetLocalMediaSession().VideoSockets.Count)
                     {
-                        // we want to verify if we already have a socket subscribed to the MSI
                         if (!this.msiToSocketIdMapping.ContainsKey(msi))
                         {
                             if (this.availableSocketIds.Any())
@@ -429,8 +328,6 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
                     }
                     else if (forceSubscribe)
                     {
-                        // here we know that all the sockets subscribed to a video we need to update the msi cache,
-                        // and obtain the socketId to reuse with the new MSI
                         updateMSICache = true;
                         subscribeToVideo = true;
                     }
@@ -440,7 +337,6 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
                         this.currentVideoSubscriptions.TryInsert(msi, out uint? dequeuedMSIValue);
                         if (dequeuedMSIValue != null)
                         {
-                            // Cache was updated, we need to use the new available socket to subscribe to the MSI
                             this.msiToSocketIdMapping.TryRemove((uint)dequeuedMSIValue, out socketId);
                         }
                     }
@@ -449,32 +345,20 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
                 if (subscribeToVideo && socketId != uint.MaxValue)
                 {
                     this.msiToSocketIdMapping.AddOrUpdate(msi, socketId, (k, v) => socketId);
-
                     this.GraphLogger.Info($"[{this.Call.Id}:SubscribeToParticipant(subscribing to the participant {participant.Id} on socket {socketId})");
                     this.BotMediaStream.Subscribe(MediaType.Video, msi, VideoResolution.HD1080p, socketId);
                 }
             }
 
-            // vbss viewer subscription
             var vbssParticipant = participant.Resource.MediaStreams.SingleOrDefault(x => x.MediaType == Modality.VideoBasedScreenSharing
             && x.Direction == MediaDirection.SendOnly);
             if (vbssParticipant != null)
             {
-                // new sharer
                 this.GraphLogger.Info($"[{this.Call.Id}:SubscribeToParticipant(subscribing to the VBSS sharer {participant.Id})");
                 this.BotMediaStream.Subscribe(MediaType.Vbss, uint.Parse(vbssParticipant.SourceId), VideoResolution.HD1080p, socketId);
             }
         }
 
-        /// <summary>
-        /// Listen for dominant speaker changes in the conference.
-        /// </summary>
-        /// <param name="sender">
-        /// The sender.
-        /// </param>
-        /// <param name="e">
-        /// The dominant speaker changed event arguments.
-        /// </param>
         private void OnDominantSpeakerChanged(object sender, DominantSpeakerChangedEventArgs e)
         {
             this.GraphLogger.Info($"[{this.Call.Id}:OnDominantSpeakerChanged(DominantSpeaker={e.CurrentDominantSpeaker})]");
@@ -482,85 +366,17 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
             if (e.CurrentDominantSpeaker != DominantSpeakerNone)
             {
                 IParticipant participant = this.GetParticipantFromMSI(e.CurrentDominantSpeaker);
-                var participantDetails = TryGetParticipantIdentity(participant, out string _);
+                var participantDetails = participant?.Resource?.Info?.Identity?.User;
                 if (participantDetails != null)
                 {
-                    // we want to force the video subscription on dominant speaker events
                     this.SubscribeToParticipantVideo(participant, forceSubscribe: true);
                 }
             }
         }
 
-        /// <summary>
-        /// Gets participant identity metadata for the specified media source id.
-        /// </summary>
-        /// <param name="mediaSourceId">The media source id.</param>
-        /// <returns>Participant identity metadata.</returns>
-        private ParticipantIdentityMetadata CreateParticipantIdentityMetadata(uint mediaSourceId)
+        private IParticipant GetParticipantFromMSI(uint msi)
         {
-            return this.CreateParticipantIdentityMetadata(this.GetParticipantFromMSI(mediaSourceId), mediaSourceId);
-        }
-
-        /// <summary>
-        /// Creates participant identity metadata for the specified participant and media source id.
-        /// </summary>
-        /// <param name="participant">The participant.</param>
-        /// <param name="mediaSourceId">The media source id.</param>
-        /// <returns>Participant identity metadata.</returns>
-        private ParticipantIdentityMetadata CreateParticipantIdentityMetadata(IParticipant participant, uint mediaSourceId)
-        {
-            var identity = TryGetParticipantIdentity(participant, out string identityType);
-
-            return new ParticipantIdentityMetadata
-            {
-                ParticipantId = participant?.Id,
-                MediaSourceId = mediaSourceId.ToString(),
-                UserId = identity?.Id,
-                DisplayName = identity?.DisplayName,
-                ParticipantTenantId = GetTenantId(identity),
-                ConfiguredOrgId = this.configuredOrgId,
-                IdentityType = identityType,
-            };
-        }
-
-        /// <summary>
-        /// Caches participant identity metadata for each media stream on the participant.
-        /// </summary>
-        /// <param name="participant">The participant.</param>
-        private void CacheParticipantMediaStreams(IParticipant participant)
-        {
-            if (participant?.Resource?.MediaStreams == null)
-            {
-                return;
-            }
-
-            foreach (var mediaStream in participant.Resource.MediaStreams)
-            {
-                if (uint.TryParse(mediaStream.SourceId, out uint mediaSourceId))
-                {
-                    this.mediaSourceIdentityMetadata[mediaSourceId] = this.CreateParticipantIdentityMetadata(participant, mediaSourceId);
-                }
-            }
-        }
-
-        /// <summary>
-        /// Removes cached participant identity metadata for each media stream on the participant.
-        /// </summary>
-        /// <param name="participant">The participant.</param>
-        private void RemoveParticipantMediaStreams(IParticipant participant)
-        {
-            if (participant?.Resource?.MediaStreams == null)
-            {
-                return;
-            }
-
-            foreach (var mediaStream in participant.Resource.MediaStreams)
-            {
-                if (uint.TryParse(mediaStream.SourceId, out uint mediaSourceId))
-                {
-                    this.mediaSourceIdentityMetadata.TryRemove(mediaSourceId, out ParticipantIdentityMetadata _);
-                }
-            }
+            return this.Call.Participants.SingleOrDefault(x => x.Resource.IsInLobby == false && x.Resource.MediaStreams.Any(y => y.SourceId == msi.ToString()));
         }
     }
 }
