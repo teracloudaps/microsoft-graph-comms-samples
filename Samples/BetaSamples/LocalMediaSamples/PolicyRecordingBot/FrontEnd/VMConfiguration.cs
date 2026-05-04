@@ -82,9 +82,19 @@ namespace Sample.PolicyRecordingBot.FrontEnd
         private const string CallControlHostKey = "CallControlHost";
 
         /// <summary>
+        /// App setting key for the local call-control listener host.
+        /// </summary>
+        private const string CallControlListenHostKey = "CallControlListenHost";
+
+        /// <summary>
         /// Prefix used for environment-variable fallback settings.
         /// </summary>
         private const string EnvironmentVariablePrefix = "POLICY_RECORDING_BOT_";
+
+        /// <summary>
+        /// Default local call-control listener host for VM hosting.
+        /// </summary>
+        private const string DefaultCallControlListenHost = "0.0.0.0";
 
         /// <summary>
         /// Default HTTPS call-control port for VM hosting.
@@ -224,6 +234,23 @@ namespace Sample.PolicyRecordingBot.FrontEnd
         }
 
         /// <summary>
+        /// Builds the local call-control listener URI.
+        /// </summary>
+        /// <param name="host">The listener host.</param>
+        /// <param name="port">The listener port.</param>
+        /// <returns>The listener URI.</returns>
+        private static Uri BuildCallControlListenUri(string host, int port)
+        {
+            var trimmedHost = (host ?? string.Empty).Trim();
+            if (string.IsNullOrWhiteSpace(trimmedHost) || trimmedHost == "+" || trimmedHost == "*")
+            {
+                throw new ConfigurationErrorsException($"Setting '{CallControlListenHostKey}' must be a URI-compatible host name or IP address. Use '+' only in the Windows URL ACL command, not in application configuration.");
+            }
+
+            return new Uri($"https://{trimmedHost}:{port}/", UriKind.Absolute);
+        }
+
+        /// <summary>
         /// Initializes configuration values from app settings and environment fallback.
         /// </summary>
         private void Initialize()
@@ -236,12 +263,13 @@ namespace Sample.PolicyRecordingBot.FrontEnd
             var callControlPort = VMConfiguration.GetIntSetting(CallControlPortKey, DefaultCallControlPort);
             var mediaPort = VMConfiguration.GetIntSetting(MediaPortKey, DefaultMediaPort);
             var callControlHost = VMConfiguration.GetOptionalSetting(CallControlHostKey) ?? this.ServiceDnsName;
+            var callControlListenHost = VMConfiguration.GetOptionalSetting(CallControlListenHostKey) ?? DefaultCallControlListenHost;
             var serviceFqdn = VMConfiguration.GetOptionalSetting(ServiceFqdnKey) ?? this.ServiceDnsName;
             var endpoint = VMConfiguration.GetOptionalSetting(PlaceCallEndpointUrlKey) ?? "https://graph.microsoft.com/v1.0";
 
             this.PlaceCallEndpointUrl = new Uri(endpoint, UriKind.Absolute);
             this.CallControlBaseUrl = new Uri($"https://{callControlHost}:{callControlPort}/{HttpRouteConstants.CallSignalingRoutePrefix}/{HttpRouteConstants.OnNotificationRequestRoute}");
-            this.CallControlListeningUrls = new[] { new Uri($"https://+:{callControlPort}/") };
+            this.CallControlListeningUrls = new[] { VMConfiguration.BuildCallControlListenUri(callControlListenHost, callControlPort) };
 
             var certificate = this.GetCertificateFromStore(this.GetCertificateThumbprint());
             var publicIpAddress = this.GetPublicIpAddress(serviceFqdn);

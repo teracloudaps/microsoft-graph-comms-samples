@@ -13,6 +13,8 @@
 namespace Sample.PolicyRecordingBot.FrontEnd
 {
     using System;
+    using System.Globalization;
+    using System.Net;
     using Microsoft.Graph.Communications.Common.Telemetry;
     using Microsoft.Owin.Hosting;
     using Sample.PolicyRecordingBot.FrontEnd.Http;
@@ -83,7 +85,7 @@ namespace Sample.PolicyRecordingBot.FrontEnd
                 var callStartOptions = new StartOptions();
                 foreach (var url in this.Configuration.CallControlListeningUrls)
                 {
-                    callStartOptions.Urls.Add(url.ToString());
+                    callStartOptions.Urls.Add(Service.GetOwinListenUrl(url));
                 }
 
                 this.callHttpServer = WebApp.Start(
@@ -115,6 +117,26 @@ namespace Sample.PolicyRecordingBot.FrontEnd
                 this.callHttpServer.Dispose();
                 Bot.Bot.Instance.Dispose();
             }
+        }
+
+        /// <summary>
+        /// Converts a configuration listener URI to an OWIN listener URL.
+        /// </summary>
+        /// <param name="listenUri">The configured listener URI.</param>
+        /// <returns>The URL to add to OWIN start options.</returns>
+        private static string GetOwinListenUrl(Uri listenUri)
+        {
+            if (listenUri == null)
+            {
+                throw new ArgumentNullException(nameof(listenUri));
+            }
+
+            if (IPAddress.TryParse(listenUri.Host, out var ipAddress) && IPAddress.Any.Equals(ipAddress))
+            {
+                return string.Format(CultureInfo.InvariantCulture, "{0}://+:{1}{2}", listenUri.Scheme, listenUri.Port, listenUri.PathAndQuery);
+            }
+
+            return listenUri.ToString();
         }
     }
 }

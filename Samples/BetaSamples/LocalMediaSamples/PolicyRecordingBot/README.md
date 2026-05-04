@@ -87,7 +87,7 @@ Use this path when running the bot directly on a Windows VM. The VM host is the 
 5. Open TCP ports `5001`, `5002`, and `5003` only to the downstream real-time processing app that consumes the bot streams.
 6. Configure the bot registration callback URL as `https://{your-dns-name}:9442/api/calling` unless you changed `CallControlPort`.
 
-Run these commands from an elevated PowerShell prompt on the VM to bind HTTPS for the self-hosted OWIN listener. Replace the certificate hash and service account with your deployment values:
+Run these commands from an elevated PowerShell prompt on the VM to bind HTTPS for the self-hosted OWIN listener. Replace the certificate hash and service account with your deployment values. The `+` wildcard is valid for the Windows URL ACL; the application config should use `CallControlListenHost=0.0.0.0` or a concrete host/IP.
 
 ```powershell
 netsh http add urlacl url=https://+:9442/ user="DOMAIN\service-account"
@@ -110,6 +110,7 @@ Configure `FrontEnd\App.config` before building, or edit the generated `Sample.P
 | `DefaultCertificate` or `CertificateThumbprint` | Yes | Thumbprint for the TLS certificate in `LocalMachine\My`. |
 | `PlaceCallEndpointUrl` | No | Microsoft Graph endpoint. Defaults to `https://graph.microsoft.com/v1.0`. |
 | `CallControlPort` | No | HTTPS call-control listener port. Defaults to `9442`. |
+| `CallControlListenHost` | No | Local listener host. Defaults to `0.0.0.0`. Do not set this to `+` or `*`; those are Windows URL ACL wildcards, not valid `System.Uri` host names. |
 | `MediaPort` | No | Local media platform port. Defaults to `8445`. |
 | `InstancePublicIPAddress` | No | Public IPv4 address for media. If omitted, the bot resolves `ServiceFqdn` or `ServiceDnsName`. |
 | `CallControlHost` | No | Public host used in the Graph notification URL. Defaults to `ServiceDnsName`. |
