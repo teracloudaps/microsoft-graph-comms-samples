@@ -72,7 +72,7 @@
       <Name>Sample.Common</Name>
     </ProjectReference>
     <ProjectReference Include="..\FrontEnd\CRFrontEnd.csproj">
-      <Project>{739d09c4-47e8-42b7-9b89-94dcb890ac0f}</Project>
+      <Project>{dd039f57-c237-4cad-9b35-686fc5f5a026}</Project>
       <Name>CRFrontEnd</Name>
     </ProjectReference>
   </ItemGroup>
