@@ -9,6 +9,22 @@ This sample is only designed for compliance recording scenario. Do not use it fo
 
 The Policy Recording bot sample guides you through building, deploying and testing a bot. This sample demonstrates how a bot can receive media streams for recording. Please note that the sample does not actually record. This logic is left up to the developer.
 
+## Participant Identity Metadata
+
+When an audio sink is enabled, received audio is published as one `IdentifiedAudioBlob` per unmixed participant buffer before the media buffer is disposed. Each blob includes a stable `StreamId`, monotonically increasing `SequenceNumber`, unique `BlobId`, media timestamps, copied audio bytes, and `ParticipantIdentityMetadata` with available participant id, user id, display name, participant tenant id, identity type, and configured org/tenant id. The default sink is disabled, so the sample does not copy audio until a real sink is supplied.
+
+For Teracloud Streams and STT workflows, use `StreamId` as the per-call/per-speaker partition key and `SequenceNumber` to detect gaps or restore ordering. Live transcript updates should keep the blob metadata through STT, and final utterance enrichment should persist the stream id plus first/last sequence numbers that produced the final utterance.
+
+Real-time sinks should keep `TryPublish` non-blocking and use a bounded queue or drop policy. Do not do network I/O, file I/O, or unbounded queueing directly from the media callback; if the consumer falls behind, queued audio will create increasing end-to-end lag. Return `CanAccept == false` when the bounded queue is full so the bot can drop before copying audio bytes while still consuming sequence numbers. The sink should leave `IncludeMixedAudioBuffer` disabled unless the downstream app explicitly needs mixed call audio in addition to per-speaker STT audio.
+
+The optional `HomeTenantId` setting is emitted as metadata only. The bot does not decide whether a participant is internal, external, guest, or unknown; downstream recording or real-time processing systems should make that decision from the emitted metadata.
+
+Add `HomeTenantId` to your `.cscfg` configuration when you want the downstream consumer to receive the bot operator's org/tenant context:
+
+```xml
+<Setting name="HomeTenantId" value="00000000-0000-0000-0000-000000000000" />
+```
+
 ## Getting Started
 
 This section walks you through the process of deploying and testing the sample bot.

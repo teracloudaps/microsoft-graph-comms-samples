@@ -43,7 +43,11 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
         // This dictionnary helps maintaining a mapping of the sockets subscriptions
         private readonly ConcurrentDictionary<uint, uint> msiToSocketIdMapping = new ConcurrentDictionary<uint, uint>();
 
+        private readonly ConcurrentDictionary<uint, ParticipantIdentityMetadata> mediaSourceIdentityMetadata = new ConcurrentDictionary<uint, ParticipantIdentityMetadata>();
+
         private readonly Timer recordingStatusFlipTimer;
+
+        private readonly string configuredOrgId;
 
         private int recordingStatusIndex = -1;
 
@@ -53,9 +57,12 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
         /// Initializes a new instance of the <see cref="CallHandler"/> class.
         /// </summary>
         /// <param name="statefulCall">The stateful call.</param>
-        public CallHandler(ICall statefulCall)
+        /// <param name="configuredOrgId">The configured org or tenant identifier emitted with participant metadata.</param>
+        /// <param name="audioBlobSink">The audio blob sink.</param>
+        public CallHandler(ICall statefulCall, string configuredOrgId, IAudioBlobSink audioBlobSink = null)
             : base(TimeSpan.FromMinutes(10), statefulCall?.GraphLogger)
         {
+            this.configuredOrgId = configuredOrgId;
             this.Call = statefulCall;
             this.Call.OnUpdated += this.CallOnUpdated;
 
@@ -69,7 +76,7 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
             this.Call.ParticipantJoiningHandler += this.ParticipantJoining;
 
             // attach the botMediaStream
-            this.BotMediaStream = new BotMediaStream(this.Call.GetLocalMediaSession(), this.GraphLogger);
+            this.BotMediaStream = new BotMediaStream(this.Call.GetLocalMediaSession(), this, this.GraphLogger, audioBlobSink);
 
             // initialize the timer
             var timer = new Timer(1000 * 60 * 5); // every 5 minutes
@@ -185,11 +192,11 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
         {
             foreach (var participant in args.AddedResources)
             {
-                // todo remove the cast with the new graph implementation,
-                // for now we want the bot to only subscribe to "real" participants
-                var participantDetails = participant.Resource.Info.Identity.User;
+                var participantDetails = TryGetParticipantIdentity(participant, out string _);
                 if (participantDetails != null)
                 {
+                    this.CacheParticipantMediaStreams(participant);
+
                     // subscribe to the participant updates, this will indicate if the user started to share,
                     // or added another modality
                     participant.OnUpdated += this.OnParticipantUpdated;
@@ -201,9 +208,11 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
 
             foreach (var participant in args.RemovedResources)
             {
-                var participantDetails = participant.Resource.Info.Identity.User;
+                var participantDetails = TryGetParticipantIdentity(participant, out string _);
                 if (participantDetails != null)
                 {
+                    this.RemoveParticipantMediaStreams(participant);
+
                     // unsubscribe to the participant updates
                     participant.OnUpdated -= this.OnParticipantUpdated;
                     this.UnsubscribeFromParticipantVideo(participant);
@@ -257,6 +266,7 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
         /// <param name="args">Event args containing the old values and the new values.</param>
         private void OnParticipantUpdated(IParticipant sender, ResourceEventArgs<Participant> args)
         {
+            this.CacheParticipantMediaStreams(sender);
             this.SubscribeToParticipantVideo(sender, forceSubscribe: false);
         }
 
@@ -378,7 +388,7 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
             if (e.CurrentDominantSpeaker != DominantSpeakerNone)
             {
                 IParticipant participant = this.GetParticipantFromMSI(e.CurrentDominantSpeaker);
-                var participantDetails = participant?.Resource?.Info?.Identity?.User;
+                var participantDetails = TryGetParticipantIdentity(participant, out string _);
                 if (participantDetails != null)
                 {
                     // we want to force the video subscription on dominant speaker events
@@ -394,9 +404,150 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
         /// <returns>
         /// The <see cref="IParticipant"/>.
         /// </returns>
-        private IParticipant GetParticipantFromMSI(uint msi)
+        internal IParticipant GetParticipantFromMSI(uint msi)
         {
             return this.Call.Participants.SingleOrDefault(x => x.Resource.IsInLobby == false && x.Resource.MediaStreams.Any(y => y.SourceId == msi.ToString()));
+        }
+
+        /// <summary>
+        /// Gets participant identity metadata for the specified media source id.
+        /// </summary>
+        /// <param name="mediaSourceId">The media source id.</param>
+        /// <returns>Participant identity metadata.</returns>
+        internal ParticipantIdentityMetadata GetParticipantIdentityMetadata(uint mediaSourceId)
+        {
+            return this.mediaSourceIdentityMetadata.GetOrAdd(mediaSourceId, this.CreateParticipantIdentityMetadata);
+        }
+
+        /// <summary>
+        /// Gets participant identity metadata for the specified media source id.
+        /// </summary>
+        /// <param name="participant">The participant.</param>
+        /// <param name="mediaSourceId">The media source id.</param>
+        /// <returns>Participant identity metadata.</returns>
+        private ParticipantIdentityMetadata CreateParticipantIdentityMetadata(uint mediaSourceId)
+        {
+            return this.CreateParticipantIdentityMetadata(this.GetParticipantFromMSI(mediaSourceId), mediaSourceId);
+        }
+
+        private ParticipantIdentityMetadata CreateParticipantIdentityMetadata(IParticipant participant, uint mediaSourceId)
+        {
+            var identity = TryGetParticipantIdentity(participant, out string identityType);
+
+            return new ParticipantIdentityMetadata
+            {
+                ParticipantId = participant?.Id,
+                MediaSourceId = mediaSourceId.ToString(),
+                UserId = identity?.Id,
+                DisplayName = identity?.DisplayName,
+                ParticipantTenantId = GetTenantId(identity),
+                ConfiguredOrgId = this.configuredOrgId,
+                IdentityType = identityType,
+            };
+        }
+
+        private void CacheParticipantMediaStreams(IParticipant participant)
+        {
+            if (participant?.Resource?.MediaStreams == null)
+            {
+                return;
+            }
+
+            foreach (var mediaStream in participant.Resource.MediaStreams)
+            {
+                if (uint.TryParse(mediaStream.SourceId, out uint mediaSourceId))
+                {
+                    this.mediaSourceIdentityMetadata[mediaSourceId] = this.CreateParticipantIdentityMetadata(participant, mediaSourceId);
+                }
+            }
+        }
+
+        private void RemoveParticipantMediaStreams(IParticipant participant)
+        {
+            if (participant?.Resource?.MediaStreams == null)
+            {
+                return;
+            }
+
+            foreach (var mediaStream in participant.Resource.MediaStreams)
+            {
+                if (uint.TryParse(mediaStream.SourceId, out uint mediaSourceId))
+                {
+                    this.mediaSourceIdentityMetadata.TryRemove(mediaSourceId, out ParticipantIdentityMetadata _);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Tries to get a usable participant identity.
+        /// </summary>
+        /// <param name="participant">The participant.</param>
+        /// <param name="identityType">The resolved identity type.</param>
+        /// <returns>The identity, if available.</returns>
+        internal static Identity TryGetParticipantIdentity(IParticipant participant, out string identityType)
+        {
+            identityType = "Unknown";
+
+            var identitySet = participant?.Resource?.Info?.Identity;
+            if (identitySet?.User != null)
+            {
+                identityType = "User";
+                return identitySet.User;
+            }
+
+            if (identitySet?.AdditionalData != null)
+            {
+                foreach (var identityData in identitySet.AdditionalData)
+                {
+                    if (string.Equals(identityData.Key, "applicationInstance", StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+
+                    if (identityData.Value is Identity identity)
+                    {
+                        identityType = $"AdditionalData:{identityData.Key}";
+                        return identity;
+                    }
+                }
+            }
+
+            return null;
+        }
+
+        /// <summary>
+        /// Gets the tenant id from an identity when the SDK exposes it directly or in additional data.
+        /// </summary>
+        /// <param name="identity">The identity.</param>
+        /// <returns>The tenant id, when available.</returns>
+        private static string GetTenantId(Identity identity)
+        {
+            if (identity == null)
+            {
+                return null;
+            }
+
+            var tenantProperty = identity.GetType().GetProperty("TenantId");
+            if (tenantProperty?.GetValue(identity) is string tenantId && !string.IsNullOrWhiteSpace(tenantId))
+            {
+                return tenantId;
+            }
+
+            if (identity.AdditionalData == null)
+            {
+                return null;
+            }
+
+            foreach (var additionalData in identity.AdditionalData)
+            {
+                if (string.Equals(additionalData.Key, "tenantId", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(additionalData.Key, "tid", StringComparison.OrdinalIgnoreCase))
+                {
+                    return additionalData.Value?.ToString();
+                }
+            }
+
+            return null;
         }
     }
 }

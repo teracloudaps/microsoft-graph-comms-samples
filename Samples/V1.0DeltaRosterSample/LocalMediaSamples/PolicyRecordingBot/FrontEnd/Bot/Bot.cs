@@ -53,6 +53,8 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
         /// </summary>
         public ICommunicationsClient Client { get; private set; }
 
+        private IConfiguration configuration;
+
         /// <inheritdoc />
         public void Dispose()
         {
@@ -61,6 +63,7 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
             this.Logger = null;
             this.Client?.Dispose();
             this.Client = null;
+            this.configuration = null;
         }
 
         /// <summary>
@@ -74,6 +77,7 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
 
             this.Logger = logger;
             this.Observer = new SampleObserver(logger);
+            this.configuration = service.Configuration;
 
             var name = this.GetType().Assembly.GetName().Name;
             var builder = new CommunicationsClientBuilder(
@@ -228,7 +232,7 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
         {
             foreach (var call in args.AddedResources)
             {
-                var callHandler = new CallHandler(call);
+                var callHandler = new CallHandler(call, this.configuration?.HomeTenantId);
                 this.CallHandlers[call.Id] = callHandler;
             }
 
