@@ -30,17 +30,21 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
         private const double SILENCEENERGYTHRESHOLD = 100.0;
         private const double SPEAKERPERSISTENCEMS = 1000;
         private const double SPEAKERCHANGEDEBOUNCEMS = 500;
+        private const int MAXQUEUEDAUDIOFRAMES = 200;
+        private const int MAXQUEUEDMETADATAMESSAGES = 100;
 
         private readonly IAudioSocket audioSocket;
         private readonly IVideoSocket vbssSocket;
         private readonly List<IVideoSocket> videoSockets;
         private readonly ILocalMediaSession mediaSession;
         private readonly ICall call;
+        private readonly BlockingCollection<byte[]> audioFrameQueue = new BlockingCollection<byte[]>(MAXQUEUEDAUDIOFRAMES);
+        private readonly BlockingCollection<byte[]> metadataMessageQueue = new BlockingCollection<byte[]>(MAXQUEUEDMETADATAMESSAGES);
+        private readonly ConcurrentDictionary<TcpClient, byte> connectedClients = new ConcurrentDictionary<TcpClient, byte>();
+        private readonly ConcurrentDictionary<TcpClient, byte> connectedMetadataClients = new ConcurrentDictionary<TcpClient, byte>();
         private TcpListener audioStreamServer;
         private TcpListener metadataStreamServer;
         private TcpListener commandServer;
-        private ConcurrentBag<TcpClient> connectedClients = new ConcurrentBag<TcpClient>();
-        private ConcurrentBag<TcpClient> connectedMetadataClients = new ConcurrentBag<TcpClient>();
         private string currentSessionId = Guid.NewGuid().ToString();
         private string agentUserId;
         private string agentDisplayName;
@@ -75,6 +79,8 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
         private int callerPacketCount = 0;
         private int unknownPacketCount = 0;
         private int silencePacketCount = 0;
+        private int droppedAudioFrameCount = 0;
+        private int droppedMetadataMessageCount = 0;
         private DateTime lastStatsLog = DateTime.UtcNow;
 
         // Detailed logging
@@ -626,6 +632,11 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
         {
             try
             {
+                if (this.connectedClients.IsEmpty)
+                {
+                    return;
+                }
+
                 // ✅ CHECK FOR UNMIXED AUDIO BUFFERS (TRUE PER-SPEAKER AUDIO)
                 if (e.Buffer.UnmixedAudioBuffers != null)
                 {
@@ -720,6 +731,11 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
 
         private void ProcessSilenceForUnmixedMode(AudioMediaReceivedEventArgs e)
         {
+            if (this.connectedClients.IsEmpty || this.participantsById.IsEmpty)
+            {
+                return;
+            }
+
             this.silencePacketCount++;
 
             // Copy silence buffer
@@ -886,34 +902,26 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
 
         private void SendAudioFrame(byte[] audioData, byte channelByte, string speakerInfo, uint? msi)
         {
-            // Calculate audio energy to detect actual speech
-            double energy = this.CalculateAudioEnergy(audioData);
-            bool hasAudio = energy > SILENCEENERGYTHRESHOLD;
-
-            using (var ms = new MemoryStream())
+            if (this.connectedClients.IsEmpty)
             {
-                // Session ID (36 bytes)
-                byte[] sessionId = Encoding.ASCII.GetBytes(
-                    this.currentSessionId.PadRight(36).Substring(0, 36));
-                ms.Write(sessionId, 0, 36);
+                return;
+            }
 
-                // Channel (1 byte)
-                ms.WriteByte(channelByte);
+            var frame = new byte[41 + audioData.Length];
+            byte[] sessionId = Encoding.ASCII.GetBytes(this.currentSessionId.PadRight(36).Substring(0, 36));
+            Buffer.BlockCopy(sessionId, 0, frame, 0, 36);
+            frame[36] = channelByte;
 
-                // Length (4 bytes, little-endian)
-                byte[] lengthBytes = BitConverter.GetBytes((uint)audioData.Length);
-                ms.Write(lengthBytes, 0, 4);
+            byte[] lengthBytes = BitConverter.GetBytes((uint)audioData.Length);
+            Buffer.BlockCopy(lengthBytes, 0, frame, 37, 4);
+            Buffer.BlockCopy(audioData, 0, frame, 41, audioData.Length);
 
-                // Audio data
-                ms.Write(audioData, 0, audioData.Length);
+            this.SendToClients(frame);
 
-                byte[] frame = ms.ToArray();
-
-                // Send to all connected clients
-                this.SendToClients(frame);
-
-                // Always log non-silence frames to debug channel routing
-                if (hasAudio && this.connectedClients.Count > 0)
+            if (this.detailedLogging)
+            {
+                double energy = this.CalculateAudioEnergy(audioData);
+                if (energy > SILENCEENERGYTHRESHOLD)
                 {
                     var channelName = channelByte == 1 ? "CH1-AGENT" :
                                      channelByte == 0 ? "CH0-CALLER" : "CH?-UNKNOWN";
@@ -937,9 +945,36 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
 
         private void SendToClients(byte[] frame)
         {
-            var deadClients = new List<TcpClient>();
+            try
+            {
+                if (this.audioFrameQueue.IsAddingCompleted || !this.audioFrameQueue.TryAdd(frame))
+                {
+                    this.droppedAudioFrameCount++;
+                }
+            }
+            catch (InvalidOperationException)
+            {
+                this.droppedAudioFrameCount++;
+            }
+        }
 
-            foreach (var client in this.connectedClients)
+        private void ProcessAudioFrameQueue()
+        {
+            try
+            {
+                foreach (var frame in this.audioFrameQueue.GetConsumingEnumerable())
+                {
+                    this.WriteAudioFrameToClients(frame);
+                }
+            }
+            catch (ObjectDisposedException)
+            {
+            }
+        }
+
+        private void WriteAudioFrameToClients(byte[] frame)
+        {
+            foreach (var client in this.connectedClients.Keys)
             {
                 try
                 {
@@ -947,24 +982,26 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
                     {
                         var stream = client.GetStream();
                         stream.Write(frame, 0, frame.Length);
-                        stream.Flush();
                     }
                     else
                     {
-                        deadClients.Add(client);
+                        this.RemoveAudioClient(client);
                     }
                 }
                 catch
                 {
-                    deadClients.Add(client);
+                    this.RemoveAudioClient(client);
                 }
             }
+        }
 
-            foreach (var dead in deadClients)
+        private void RemoveAudioClient(TcpClient client)
+        {
+            if (this.connectedClients.TryRemove(client, out byte _))
             {
                 try
                 {
-                    dead.Close();
+                    client.Close();
                 }
                 catch
                 {
@@ -987,11 +1024,11 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
 
             if (this.unmixedAudioEnabled)
             {
-                Console.WriteLine($"Unmixed packets: {this.unmixedPacketCount}");
+                Console.WriteLine($"Unmixed packets: {this.unmixedPacketCount}, dropped audio frames: {this.droppedAudioFrameCount}, dropped metadata messages: {this.droppedMetadataMessageCount}");
             }
             else
             {
-                Console.WriteLine($"Mixed packets: {this.mixedPacketCount}");
+                Console.WriteLine($"Mixed packets: {this.mixedPacketCount}, dropped audio frames: {this.droppedAudioFrameCount}, dropped metadata messages: {this.droppedMetadataMessageCount}");
             }
         }
 
@@ -1051,8 +1088,9 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
                 try
                 {
                     var client = await this.audioStreamServer.AcceptTcpClientAsync().ConfigureAwait(false);
+                    client.NoDelay = true;
                     Console.WriteLine($"STT client connected: {((IPEndPoint)client.Client.RemoteEndPoint).Address}");
-                    this.connectedClients.Add(client);
+                    this.connectedClients[client] = 0;
                 }
                 catch (Exception ex)
                 {
@@ -1072,6 +1110,7 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
                 this.audioStreamServer.Start();
                 Console.WriteLine("Audio stream server listening on port 5001");
 
+                Task.Run(() => this.ProcessAudioFrameQueue());
                 Task.Run(async () => await this.AcceptClientsAsync().ConfigureAwait(false));
             }
             catch (Exception ex)
@@ -1094,7 +1133,7 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
 
                     byte[] closeFrame = ms.ToArray();
 
-                    foreach (var client in this.connectedClients)
+                    foreach (var client in this.connectedClients.Keys)
                     {
                         try
                         {
@@ -1105,6 +1144,11 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
                         {
                         }
                     }
+                }
+
+                if (!this.audioFrameQueue.IsAddingCompleted)
+                {
+                    this.audioFrameQueue.CompleteAdding();
                 }
 
                 this.audioStreamServer?.Stop();
@@ -1125,6 +1169,7 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
                 this.metadataStreamServer.Start();
                 Console.WriteLine("LISTENING: 0.0.0.0:5002 (Metadata Stream)");
 
+                Task.Run(() => this.ProcessMetadataMessageQueue());
                 _ = Task.Run(async () => await this.AcceptMetadataClientsAsync().ConfigureAwait(false));
             }
             catch (Exception ex)
@@ -1140,8 +1185,9 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
                 try
                 {
                     var client = await this.metadataStreamServer.AcceptTcpClientAsync().ConfigureAwait(false);
+                    client.NoDelay = true;
                     Console.WriteLine($" Metadata client connected: {((IPEndPoint)client.Client.RemoteEndPoint).Address}");
-                    this.connectedMetadataClients.Add(client);
+                    this.connectedMetadataClients[client] = 0;
                     this.SendCurrentParticipantsSnapshot(client);
                 }
                 catch (Exception ex)
@@ -1189,37 +1235,16 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
 
                 Console.WriteLine($"FLOW[Bot->SPL] session={this.currentSessionId} event={eventType} userId={info.UserId ?? string.Empty} participantId={info.ParticipantId ?? string.Empty} name={info.DisplayName ?? string.Empty} role={info.Role ?? string.Empty} callerType={info.CallerType ?? string.Empty} isInternal={info.IsInternal} isAgent={info.IsAgent} channel={info.ChannelId}");
 
-                var deadClients = new List<TcpClient>();
-                foreach (var client in this.connectedMetadataClients)
+                try
                 {
-                    try
+                    if (this.metadataMessageQueue.IsAddingCompleted || !this.metadataMessageQueue.TryAdd(jsonBytes))
                     {
-                        if (client.Connected)
-                        {
-                            var stream = client.GetStream();
-                            stream.Write(jsonBytes, 0, jsonBytes.Length);
-                            stream.Flush();
-                        }
-                        else
-                        {
-                            deadClients.Add(client);
-                        }
-                    }
-                    catch
-                    {
-                        deadClients.Add(client);
+                        this.droppedMetadataMessageCount++;
                     }
                 }
-
-                foreach (var dead in deadClients)
+                catch (InvalidOperationException)
                 {
-                    try
-                    {
-                        dead.Close();
-                    }
-                    catch
-                    {
-                    }
+                    this.droppedMetadataMessageCount++;
                 }
             }
             catch (Exception ex)
@@ -1249,11 +1274,62 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
             return sb.ToString();
         }
 
+        private void ProcessMetadataMessageQueue()
+        {
+            try
+            {
+                foreach (var message in this.metadataMessageQueue.GetConsumingEnumerable())
+                {
+                    this.WriteMetadataMessageToClients(message);
+                }
+            }
+            catch (ObjectDisposedException)
+            {
+            }
+        }
+
+        private void WriteMetadataMessageToClients(byte[] message)
+        {
+            foreach (var client in this.connectedMetadataClients.Keys)
+            {
+                try
+                {
+                    if (client.Connected)
+                    {
+                        var stream = client.GetStream();
+                        stream.Write(message, 0, message.Length);
+                    }
+                    else
+                    {
+                        this.RemoveMetadataClient(client);
+                    }
+                }
+                catch
+                {
+                    this.RemoveMetadataClient(client);
+                }
+            }
+        }
+
+        private void RemoveMetadataClient(TcpClient client)
+        {
+            if (this.connectedMetadataClients.TryRemove(client, out byte _))
+            {
+                try
+                {
+                    client.Close();
+                }
+                catch
+                {
+                }
+            }
+        }
+
         private void StopMetadataStreamServer()
         {
             try
             {
-                foreach (var client in this.connectedMetadataClients)
+                foreach (var client in this.connectedMetadataClients.Keys)
                 {
                     try
                     {
@@ -1266,7 +1342,11 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
 
                 this.metadataStreamServer?.Stop();
                 this.metadataStreamServer = null;
-                this.connectedMetadataClients = new ConcurrentBag<TcpClient>();
+                if (!this.metadataMessageQueue.IsAddingCompleted)
+                {
+                    this.metadataMessageQueue.CompleteAdding();
+                }
+
                 Console.WriteLine("Metadata stream server stopped");
             }
             catch
