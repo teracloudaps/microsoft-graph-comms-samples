@@ -7,19 +7,23 @@ This sample is only designed for compliance recording scenario. Do not use it fo
 
 ## About
 
-The Policy Recording bot sample guides you through building, deploying and testing a bot. This sample demonstrates how a bot can receive media streams for recording. Please note that the sample does not actually record. This logic is left up to the developer.
+The Policy Recording bot sample guides you through building, deploying, and testing a Teams policy recording bot. In this version, the `FrontEnd` project can run directly as a VM-hosted console application. The bot joins policy-recorded calls, receives real-time media, and streams audio plus participant identity metadata to a downstream real-time processing application. The sample still does not persist recordings; recording, transcription, storage, and compliance decisions are left to the downstream consumer.
 
-## Participant Identity Metadata
+## Real-Time Audio And Participant Metadata
 
-When an audio sink is enabled, received audio is published as one `IdentifiedAudioBlob` per unmixed participant buffer before the media buffer is disposed. Each blob includes a stable `StreamId`, monotonically increasing `SequenceNumber`, unique `BlobId`, media timestamps, copied audio bytes, and flattened participant identity fields (`UserId`, `DisplayName`, `ParticipantTenantId`, `ConfiguredOrgId`, and `IdentityType`) for the Teracloud Streams `TeamsBotOp` metadata parser. The full `ParticipantIdentityMetadata` object is also included for richer consumers. The default sink is disabled, so the sample does not copy audio until a real sink is supplied.
+The VM-hosted bot exposes three TCP streams for the real-time processing app:
 
-For Teracloud Streams and STT workflows, use `StreamId` as the per-call/per-speaker partition key and `SequenceNumber` to detect gaps or restore ordering. Live transcript updates should keep the blob metadata through STT, and final utterance enrichment should persist the stream id plus first/last sequence numbers that produced the final utterance.
+| Port | Purpose | Payload |
+| --- | --- | --- |
+| `5001` | Audio stream | Binary frames containing session id, channel id, payload length, and PCM audio bytes. |
+| `5002` | Participant metadata stream | Newline-delimited JSON events for participant `JOIN`, `UPDATE`, `LEAVE`, and initial `CURRENT` snapshots. |
+| `5003` | Command stream | Newline-delimited JSON commands. The current command is `SET_AGENT`, with `userId` and `displayName`. |
 
-Real-time sinks should keep `TryPublish` non-blocking and use a bounded queue or drop policy. Do not do network I/O, file I/O, or unbounded queueing directly from the media callback; if the consumer falls behind, queued audio will create increasing end-to-end lag. Return `CanAccept == false` when the bounded queue is full so the bot can drop before copying audio bytes while still consuming sequence numbers. The sink should leave `IncludeMixedAudioBuffer` disabled unless the downstream app explicitly needs mixed call audio in addition to per-speaker STT audio.
+Audio frames are written from bounded background queues so slow consumers do not block the media callback. If the downstream app falls behind, frames or metadata messages can be dropped instead of allowing unbounded lag to build up. Keep the consumer connected and reading continuously from ports `5001` and `5002` for the lowest latency.
 
-The optional `HomeTenantId` setting is emitted as metadata only. The bot does not decide whether a participant is internal, external, guest, or unknown; downstream recording or real-time processing systems should make that decision from the emitted metadata.
+Participant metadata includes `sessionId`, `participantId`, `userId`, `displayName`, `role`, `tenantId`, `configuredOrgId`, `callerType`, `isInternal`, `isAgent`, and `channelId`. `configuredOrgId` is metadata only. The bot does not decide whether a participant is internal, external, guest, or unknown; downstream recording or real-time processing systems should make that decision from the emitted metadata.
 
-Add `HomeTenantId` to your `.cscfg` configuration when you want the downstream consumer to receive the bot operator's org/tenant context:
+For Azure Cloud Service deployments, add `HomeTenantId` to your `.cscfg` configuration when you want the downstream consumer to receive the bot operator's org/tenant context:
 
 ```xml
 <Setting name="HomeTenantId" value="00000000-0000-0000-0000-000000000000" />
@@ -72,7 +76,60 @@ To verify your policy was assigned correctly:
     * [Visual Studio 2017+](https://visualstudio.microsoft.com/downloads/)
     * [PostMan](https://chrome.google.com/webstore/detail/postman/fhbjgbiflinjbdggehcddcbncdddomop)
 
-### Deploy
+### Run On A VM
+
+Use this path when running the bot directly on a Windows VM. The VM host is the `FrontEnd` project, which builds to `Sample.PolicyRecordingBot.FrontEnd.exe`. The Azure Cloud Service worker role remains available for cloud-service packaging, but it is not required for the console-hosted VM deployment.
+
+1. Provision a Windows VM with .NET Framework 4.7.2 or later.
+2. Assign a public DNS name, for example `bot.contoso.com`, that resolves to the VM public IP.
+3. Install a trusted TLS certificate in `LocalMachine\My`. The certificate subject or SAN should match the public DNS name.
+4. Open inbound TCP ports for call control and media. The defaults are `9442` for HTTPS call control and `8445` for media.
+5. Open TCP ports `5001`, `5002`, and `5003` only to the downstream real-time processing app that consumes the bot streams.
+6. Configure the bot registration callback URL as `https://{your-dns-name}:9442/api/calling` unless you changed `CallControlPort`.
+
+Run these commands from an elevated PowerShell prompt on the VM to bind HTTPS for the self-hosted OWIN listener. Replace the certificate hash and service account with your deployment values:
+
+```powershell
+netsh http add urlacl url=https://+:9442/ user="DOMAIN\service-account"
+netsh http add sslcert ipport=0.0.0.0:9442 certhash=<certificate-thumbprint-without-spaces> appid="{00000000-0000-0000-0000-000000000001}"
+```
+
+Build the frontend executable from a Visual Studio Developer Command Prompt:
+
+```cmd
+msbuild Samples\BetaSamples\LocalMediaSamples\PolicyRecordingBot\FrontEnd\CRFrontEnd.csproj /p:Configuration=Release /p:Platform="Any CPU"
+```
+
+Configure `FrontEnd\App.config` before building, or edit the generated `Sample.PolicyRecordingBot.FrontEnd.exe.config` next to the executable after deployment. Required secrets should preferably be supplied with environment variables instead of checked into config files. The VM configuration reads `AppSettings` first, then environment variables with either the same key or a `POLICY_RECORDING_BOT_` prefix.
+
+| Setting | Required | Description |
+| --- | --- | --- |
+| `ServiceDnsName` | Yes | Public DNS name for the bot, such as `bot.contoso.com`. |
+| `AadAppId` | Yes | Bot Azure AD application id. |
+| `AadAppSecret` | Yes | Bot application secret. Prefer an environment variable. |
+| `DefaultCertificate` or `CertificateThumbprint` | Yes | Thumbprint for the TLS certificate in `LocalMachine\My`. |
+| `PlaceCallEndpointUrl` | No | Microsoft Graph endpoint. Defaults to `https://graph.microsoft.com/v1.0`. |
+| `CallControlPort` | No | HTTPS call-control listener port. Defaults to `9442`. |
+| `MediaPort` | No | Local media platform port. Defaults to `8445`. |
+| `InstancePublicIPAddress` | No | Public IPv4 address for media. If omitted, the bot resolves `ServiceFqdn` or `ServiceDnsName`. |
+| `CallControlHost` | No | Public host used in the Graph notification URL. Defaults to `ServiceDnsName`. |
+| `ServiceFqdn` | No | FQDN used by the media platform. Defaults to `ServiceDnsName`. |
+| `HomeTenantId` | No | Tenant/org id emitted in participant metadata as `configuredOrgId`. |
+
+Example environment-based configuration for an interactive test run:
+
+```cmd
+set POLICY_RECORDING_BOT_ServiceDnsName=bot.contoso.com
+set POLICY_RECORDING_BOT_AadAppId=00000000-0000-0000-0000-000000000000
+set POLICY_RECORDING_BOT_AadAppSecret=<bot-secret>
+set POLICY_RECORDING_BOT_DefaultCertificate=<certificate-thumbprint-without-spaces>
+set POLICY_RECORDING_BOT_HomeTenantId=00000000-0000-0000-0000-000000000000
+Sample.PolicyRecordingBot.FrontEnd.exe
+```
+
+On startup the console prints the call-control callback URL, listener URLs, and media endpoint. Leave the process running while the policy-recorded call is active. Press `ENTER` or `Ctrl+C` to stop the bot cleanly.
+
+### Deploy To Azure Cloud Services
 
 * Prerequisites for deploying Azure Cloud Services (extended support)(https://learn.microsoft.com/en-us/azure/cloud-services-extended-support/deploy-prerequisite)
 
