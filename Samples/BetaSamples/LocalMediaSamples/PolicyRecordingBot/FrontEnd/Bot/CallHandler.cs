@@ -1,4 +1,11 @@
-﻿namespace Sample.PolicyRecordingBot.FrontEnd.Bot
+﻿// <copyright file="CallHandler.cs" company="Microsoft Corporation">
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT license.
+// </copyright>
+
+#pragma warning disable SA1600 // Recovered sample internals are intentionally kept close to the upstream PoC shape.
+
+namespace Sample.PolicyRecordingBot.FrontEnd.Bot
 {
     using System;
     using System.Collections.Concurrent;

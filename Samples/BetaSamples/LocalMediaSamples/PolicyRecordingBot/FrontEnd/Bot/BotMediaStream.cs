@@ -1,4 +1,9 @@
-﻿// BotMediaStream.cs - WITH UNMIXED AUDIO SUPPORT + MSI FALLBACK
+﻿// <copyright file="BotMediaStream.cs" company="Microsoft Corporation">
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT license.
+// </copyright>
+
+#pragma warning disable SA1600 // Recovered sample internals are intentionally kept close to the upstream PoC shape.
 
 namespace Sample.PolicyRecordingBot.FrontEnd.Bot
 {
@@ -24,7 +29,10 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
     using Microsoft.Skype.Bots.Media;
     using Microsoft.Skype.Internal.Media.Services.Common;
 
-    public class BotMediaStream : ObjectRootDisposable
+    /// <summary>
+    /// Handles media socket events and forwards real-time audio plus participant metadata to local TCP consumers.
+    /// </summary>
+    internal class BotMediaStream : ObjectRootDisposable
     {
         private const int ENERGYHISTORYSIZE = 10;
         private const double SILENCEENERGYTHRESHOLD = 100.0;
@@ -88,6 +96,15 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
         private System.Timers.Timer participantCheckTimer;
         private int participantCheckCount;
 
+        /// <summary>
+        /// Initializes a new instance of the <see cref="BotMediaStream"/> class.
+        /// </summary>
+        /// <param name="mediaSession">The local media session.</param>
+        /// <param name="logger">The graph logger.</param>
+        /// <param name="call">The active call.</param>
+        /// <param name="agentUserId">The configured agent user id.</param>
+        /// <param name="agentDisplayName">The configured agent display name.</param>
+        /// <param name="configuredOrgId">The configured org or tenant id to emit as metadata.</param>
         public BotMediaStream(
             ILocalMediaSession mediaSession,
             IGraphLogger logger,
@@ -155,8 +172,15 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
             this.StartCommandServer();
         }
 
+        /// <summary>
+        /// Gets the configured agent user id.
+        /// </summary>
         public string AgentUserId => this.agentUserId;
 
+        /// <summary>
+        /// Registers a participant discovered by the call handler.
+        /// </summary>
+        /// <param name="participant">The participant to register.</param>
         public void RegisterParticipantFromCallHandler(IParticipant participant)
         {
             try
@@ -176,6 +200,93 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
             {
                 Console.WriteLine($"Error registering participant from CallHandler: {ex.Message}");
             }
+        }
+
+        /// <summary>
+        /// Subscribes a video socket to a media source.
+        /// </summary>
+        /// <param name="mediaType">The media type to subscribe.</param>
+        /// <param name="mediaSourceId">The media source id.</param>
+        /// <param name="videoResolution">The requested video resolution.</param>
+        /// <param name="socketId">The socket id to use for video subscriptions.</param>
+        public void Subscribe(MediaType mediaType, uint mediaSourceId, VideoResolution videoResolution, uint socketId = 0)
+        {
+            try
+            {
+                this.ValidateSubscriptionMediaType(mediaType);
+                if (mediaType == MediaType.Vbss)
+                {
+                    this.vbssSocket?.Subscribe(videoResolution, mediaSourceId);
+                }
+                else if (mediaType == MediaType.Video)
+                {
+                    this.videoSockets?[(int)socketId]?.Subscribe(videoResolution, mediaSourceId);
+                }
+            }
+            catch (Exception ex)
+            {
+                this.GraphLogger.Error(ex, $"Video subscription failed");
+            }
+        }
+
+        /// <summary>
+        /// Unsubscribes a video socket from its current media source.
+        /// </summary>
+        /// <param name="mediaType">The media type to unsubscribe.</param>
+        /// <param name="socketId">The socket id to use for video subscriptions.</param>
+        public void Unsubscribe(MediaType mediaType, uint socketId = 0)
+        {
+            try
+            {
+                this.ValidateSubscriptionMediaType(mediaType);
+                if (mediaType == MediaType.Vbss)
+                {
+                    this.vbssSocket?.Unsubscribe();
+                }
+                else if (mediaType == MediaType.Video)
+                {
+                    this.videoSockets?[(int)socketId]?.Unsubscribe();
+                }
+            }
+            catch (Exception ex)
+            {
+                this.GraphLogger.Error(ex, $"Unsubscribing failed");
+            }
+        }
+
+        /// <inheritdoc/>
+        protected override void Dispose(bool disposing)
+        {
+            base.Dispose(disposing);
+
+            if (this.participantCheckTimer != null)
+            {
+                this.participantCheckTimer.Stop();
+                this.participantCheckTimer.Elapsed -= this.CheckForParticipants;
+                this.participantCheckTimer.Dispose();
+            }
+
+            this.audioSocket.AudioMediaReceived -= this.OnAudioMediaReceived;
+            this.audioSocket.DominantSpeakerChanged -= this.OnDominantSpeakerChanged;
+
+            if (this.call != null)
+            {
+                this.call.Participants.OnUpdated -= this.OnParticipantsUpdated;
+            }
+
+            if (this.videoSockets?.Any() == true)
+            {
+                this.videoSockets.ForEach(videoSocket => videoSocket.VideoMediaReceived -= this.OnVideoMediaReceived);
+            }
+
+            if (this.vbssSocket != null)
+            {
+                this.vbssSocket.VideoMediaReceived -= this.OnVbssMediaReceived;
+            }
+
+            this.StopAudioStreamServer();
+            this.StopMetadataStreamServer();
+            this.StopCommandServer();
         }
 
         private void CheckForParticipants(object sender, System.Timers.ElapsedEventArgs e)
@@ -1032,47 +1143,6 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
             }
         }
 
-        // Video subscription methods (unchanged)
-        public void Subscribe(MediaType mediaType, uint mediaSourceId, VideoResolution videoResolution, uint socketId = 0)
-        {
-            try
-            {
-                this.ValidateSubscriptionMediaType(mediaType);
-                if (mediaType == MediaType.Vbss)
-                {
-                    this.vbssSocket?.Subscribe(videoResolution, mediaSourceId);
-                }
-                else if (mediaType == MediaType.Video)
-                {
-                    this.videoSockets?[(int)socketId]?.Subscribe(videoResolution, mediaSourceId);
-                }
-            }
-            catch (Exception ex)
-            {
-                this.GraphLogger.Error(ex, $"Video subscription failed");
-            }
-        }
-
-        public void Unsubscribe(MediaType mediaType, uint socketId = 0)
-        {
-            try
-            {
-                this.ValidateSubscriptionMediaType(mediaType);
-                if (mediaType == MediaType.Vbss)
-                {
-                    this.vbssSocket?.Unsubscribe();
-                }
-                else if (mediaType == MediaType.Video)
-                {
-                    this.videoSockets?[(int)socketId]?.Unsubscribe();
-                }
-            }
-            catch (Exception ex)
-            {
-                this.GraphLogger.Error(ex, $"Unsubscribing failed");
-            }
-        }
-
         private void ValidateSubscriptionMediaType(MediaType mediaType)
         {
             if (mediaType != MediaType.Vbss && mediaType != MediaType.Video)
@@ -1483,62 +1553,42 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
             e.Buffer.Dispose();
         }
 
-        protected override void Dispose(bool disposing)
-        {
-            base.Dispose(disposing);
-
-            if (this.participantCheckTimer != null)
-            {
-                this.participantCheckTimer.Stop();
-                this.participantCheckTimer.Elapsed -= this.CheckForParticipants;
-                this.participantCheckTimer.Dispose();
-            }
-
-            this.audioSocket.AudioMediaReceived -= this.OnAudioMediaReceived;
-            this.audioSocket.DominantSpeakerChanged -= this.OnDominantSpeakerChanged;
-
-            if (this.call != null)
-            {
-                this.call.Participants.OnUpdated -= this.OnParticipantsUpdated;
-            }
-
-            if (this.videoSockets?.Any() == true)
-            {
-                this.videoSockets.ForEach(videoSocket => videoSocket.VideoMediaReceived -= this.OnVideoMediaReceived);
-            }
-
-            if (this.vbssSocket != null)
-            {
-                this.vbssSocket.VideoMediaReceived -= this.OnVbssMediaReceived;
-            }
-
-            this.StopAudioStreamServer();
-            this.StopMetadataStreamServer();
-            this.StopCommandServer();
-        }
-
         private class ParticipantInfo
         {
-            public string ParticipantId { get; set; }
-            public string UserId { get; set; }
-            public string DisplayName { get; set; }
-            public string Role { get; set; }
-            public byte ChannelId { get; set; }
-            public bool IsAgent { get; set; }
-            public bool IsMsiFallback { get; set; }
-            public string CallerType { get; set; }
-            public bool IsInternal { get; set; }
-            public string TenantId { get; set; }
-            public string ConfiguredOrgId { get; set; }
-            public List<uint> MediaStreamIds { get; set; }
-            public DateTime JoinTime { get; set; }
+            internal string ParticipantId { get; set; }
+
+            internal string UserId { get; set; }
+
+            internal string DisplayName { get; set; }
+
+            internal string Role { get; set; }
+
+            internal byte ChannelId { get; set; }
+
+            internal bool IsAgent { get; set; }
+
+            internal bool IsMsiFallback { get; set; }
+
+            internal string CallerType { get; set; }
+
+            internal bool IsInternal { get; set; }
+
+            internal string TenantId { get; set; }
+
+            internal string ConfiguredOrgId { get; set; }
+
+            internal List<uint> MediaStreamIds { get; set; }
+
+            internal DateTime JoinTime { get; set; }
         }
 
         private class ChannelDetermination
         {
-            public byte ChannelId { get; set; }
-            public string SpeakerInfo { get; set; }
-            public string Confidence { get; set; }
+            internal byte ChannelId { get; set; }
+
+            internal string SpeakerInfo { get; set; }
+
+            internal string Confidence { get; set; }
         }
     }
 }

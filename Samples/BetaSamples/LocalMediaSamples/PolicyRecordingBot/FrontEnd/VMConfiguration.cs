@@ -21,22 +21,84 @@ namespace Sample.PolicyRecordingBot.FrontEnd
     /// </summary>
     public class VMConfiguration : IConfiguration
     {
+        /// <summary>
+        /// App setting key for the public service DNS name.
+        /// </summary>
         private const string ServiceDnsNameKey = "ServiceDnsName";
+
+        /// <summary>
+        /// App setting key for the bot application id.
+        /// </summary>
         private const string AadAppIdKey = "AadAppId";
+
+        /// <summary>
+        /// App setting key for the bot application secret.
+        /// </summary>
         private const string AadAppSecretKey = "AadAppSecret";
+
+        /// <summary>
+        /// App setting key for the optional tenant id emitted in metadata.
+        /// </summary>
         private const string HomeTenantIdKey = "HomeTenantId";
+
+        /// <summary>
+        /// App setting key for the Microsoft Graph base endpoint.
+        /// </summary>
         private const string PlaceCallEndpointUrlKey = "PlaceCallEndpointUrl";
+
+        /// <summary>
+        /// App setting key for the default certificate thumbprint.
+        /// </summary>
         private const string DefaultCertificateKey = "DefaultCertificate";
+
+        /// <summary>
+        /// Alternate app setting key for the certificate thumbprint.
+        /// </summary>
         private const string CertificateThumbprintKey = "CertificateThumbprint";
+
+        /// <summary>
+        /// App setting key for the call-control port.
+        /// </summary>
         private const string CallControlPortKey = "CallControlPort";
+
+        /// <summary>
+        /// App setting key for the media port.
+        /// </summary>
         private const string MediaPortKey = "MediaPort";
+
+        /// <summary>
+        /// App setting key for the public media IP address.
+        /// </summary>
         private const string InstancePublicIpAddressKey = "InstancePublicIPAddress";
+
+        /// <summary>
+        /// App setting key for the media service FQDN.
+        /// </summary>
         private const string ServiceFqdnKey = "ServiceFqdn";
+
+        /// <summary>
+        /// App setting key for the public call-control host.
+        /// </summary>
         private const string CallControlHostKey = "CallControlHost";
+
+        /// <summary>
+        /// Prefix used for environment-variable fallback settings.
+        /// </summary>
         private const string EnvironmentVariablePrefix = "POLICY_RECORDING_BOT_";
+
+        /// <summary>
+        /// Default HTTPS call-control port for VM hosting.
+        /// </summary>
         private const int DefaultCallControlPort = 9442;
+
+        /// <summary>
+        /// Default media port for VM hosting.
+        /// </summary>
         private const int DefaultMediaPort = 8445;
 
+        /// <summary>
+        /// Graph logger.
+        /// </summary>
         private readonly IGraphLogger logger;
 
         /// <summary>
@@ -78,24 +140,110 @@ namespace Sample.PolicyRecordingBot.FrontEnd
         {
         }
 
+        /// <summary>
+        /// Gets a required setting.
+        /// </summary>
+        /// <param name="key">The setting key.</param>
+        /// <returns>The configured value.</returns>
+        private static string GetRequiredSetting(string key)
+        {
+            var value = VMConfiguration.GetOptionalSetting(key);
+            if (string.IsNullOrWhiteSpace(value) || VMConfiguration.IsPlaceholderValue(value))
+            {
+                throw new ConfigurationErrorsException($"Missing required setting '{key}'. Set it in FrontEnd App.config or environment variable '{EnvironmentVariablePrefix}{key}'.");
+            }
+
+            return value.Trim();
+        }
+
+        /// <summary>
+        /// Gets an optional setting from app settings or environment variables.
+        /// </summary>
+        /// <param name="key">The setting key.</param>
+        /// <returns>The configured value, or null when not configured.</returns>
+        private static string GetOptionalSetting(string key)
+        {
+            var value = ConfigurationManager.AppSettings[key];
+            if (!string.IsNullOrWhiteSpace(value) && !VMConfiguration.IsPlaceholderValue(value))
+            {
+                return value.Trim();
+            }
+
+            value = Environment.GetEnvironmentVariable(key);
+            if (!string.IsNullOrWhiteSpace(value))
+            {
+                return value.Trim();
+            }
+
+            value = Environment.GetEnvironmentVariable(EnvironmentVariablePrefix + key);
+            return string.IsNullOrWhiteSpace(value) ? null : value.Trim();
+        }
+
+        /// <summary>
+        /// Gets a TCP port setting.
+        /// </summary>
+        /// <param name="key">The setting key.</param>
+        /// <param name="defaultValue">The default value.</param>
+        /// <returns>The configured TCP port.</returns>
+        private static int GetIntSetting(string key, int defaultValue)
+        {
+            var value = VMConfiguration.GetOptionalSetting(key);
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                return defaultValue;
+            }
+
+            if (!int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsed) || parsed <= 0 || parsed > 65535)
+            {
+                throw new ConfigurationErrorsException($"Setting '{key}' must be a TCP port between 1 and 65535.");
+            }
+
+            return parsed;
+        }
+
+        /// <summary>
+        /// Checks whether a configured value is still a deployment placeholder.
+        /// </summary>
+        /// <param name="value">The setting value.</param>
+        /// <returns>True when the value is a placeholder; otherwise, false.</returns>
+        private static bool IsPlaceholderValue(string value)
+        {
+            var trimmed = value.Trim();
+            return (trimmed.StartsWith("%", StringComparison.Ordinal) && trimmed.EndsWith("%", StringComparison.Ordinal)) ||
+                   (trimmed.StartsWith("$", StringComparison.Ordinal) && trimmed.EndsWith("$", StringComparison.Ordinal));
+        }
+
+        /// <summary>
+        /// Normalizes a certificate thumbprint for certificate-store lookup.
+        /// </summary>
+        /// <param name="thumbprint">The certificate thumbprint.</param>
+        /// <returns>The normalized thumbprint.</returns>
+        private static string NormalizeThumbprint(string thumbprint)
+        {
+            return thumbprint?.Replace(" ", string.Empty).Trim().ToUpperInvariant();
+        }
+
+        /// <summary>
+        /// Initializes configuration values from app settings and environment fallback.
+        /// </summary>
         private void Initialize()
         {
-            this.ServiceDnsName = GetRequiredSetting(ServiceDnsNameKey);
-            this.AadAppId = GetRequiredSetting(AadAppIdKey);
-            this.AadAppSecret = GetRequiredSetting(AadAppSecretKey);
-            this.HomeTenantId = GetOptionalSetting(HomeTenantIdKey)?.Trim();
+            this.ServiceDnsName = VMConfiguration.GetRequiredSetting(ServiceDnsNameKey);
+            this.AadAppId = VMConfiguration.GetRequiredSetting(AadAppIdKey);
+            this.AadAppSecret = VMConfiguration.GetRequiredSetting(AadAppSecretKey);
+            this.HomeTenantId = VMConfiguration.GetOptionalSetting(HomeTenantIdKey)?.Trim();
 
-            var callControlPort = GetIntSetting(CallControlPortKey, DefaultCallControlPort);
-            var mediaPort = GetIntSetting(MediaPortKey, DefaultMediaPort);
-            var callControlHost = GetOptionalSetting(CallControlHostKey) ?? this.ServiceDnsName;
-            var serviceFqdn = GetOptionalSetting(ServiceFqdnKey) ?? this.ServiceDnsName;
-            var endpoint = GetOptionalSetting(PlaceCallEndpointUrlKey) ?? "https://graph.microsoft.com/v1.0";
+            var callControlPort = VMConfiguration.GetIntSetting(CallControlPortKey, DefaultCallControlPort);
+            var mediaPort = VMConfiguration.GetIntSetting(MediaPortKey, DefaultMediaPort);
+            var callControlHost = VMConfiguration.GetOptionalSetting(CallControlHostKey) ?? this.ServiceDnsName;
+            var serviceFqdn = VMConfiguration.GetOptionalSetting(ServiceFqdnKey) ?? this.ServiceDnsName;
+            var endpoint = VMConfiguration.GetOptionalSetting(PlaceCallEndpointUrlKey) ?? "https://graph.microsoft.com/v1.0";
 
             this.PlaceCallEndpointUrl = new Uri(endpoint, UriKind.Absolute);
             this.CallControlBaseUrl = new Uri($"https://{callControlHost}:{callControlPort}/{HttpRouteConstants.CallSignalingRoutePrefix}/{HttpRouteConstants.OnNotificationRequestRoute}");
             this.CallControlListeningUrls = new[] { new Uri($"https://+:{callControlPort}/") };
 
-            var certificate = this.GetCertificateFromStore(GetCertificateThumbprint());
+            var certificate = this.GetCertificateFromStore(this.GetCertificateThumbprint());
             var publicIpAddress = this.GetPublicIpAddress(serviceFqdn);
 
             this.MediaPlatformSettings = new MediaPlatformSettings
@@ -118,68 +266,20 @@ namespace Sample.PolicyRecordingBot.FrontEnd
             this.TraceConfigValue("MediaPlatformFqdn", serviceFqdn);
         }
 
-        private static string GetRequiredSetting(string key)
-        {
-            var value = GetOptionalSetting(key);
-            if (string.IsNullOrWhiteSpace(value) || IsPlaceholderValue(value))
-            {
-                throw new ConfigurationErrorsException($"Missing required setting '{key}'. Set it in FrontEnd App.config or environment variable '{EnvironmentVariablePrefix}{key}'.");
-            }
-
-            return value.Trim();
-        }
-
-        private static string GetOptionalSetting(string key)
-        {
-            var value = ConfigurationManager.AppSettings[key];
-            if (!string.IsNullOrWhiteSpace(value) && !IsPlaceholderValue(value))
-            {
-                return value.Trim();
-            }
-
-            value = Environment.GetEnvironmentVariable(key);
-            if (!string.IsNullOrWhiteSpace(value))
-            {
-                return value.Trim();
-            }
-
-            value = Environment.GetEnvironmentVariable(EnvironmentVariablePrefix + key);
-            return string.IsNullOrWhiteSpace(value) ? null : value.Trim();
-        }
-
-        private static int GetIntSetting(string key, int defaultValue)
-        {
-            var value = GetOptionalSetting(key);
-            if (string.IsNullOrWhiteSpace(value))
-            {
-                return defaultValue;
-            }
-
-            if (!int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsed) || parsed <= 0 || parsed > 65535)
-            {
-                throw new ConfigurationErrorsException($"Setting '{key}' must be a TCP port between 1 and 65535.");
-            }
-
-            return parsed;
-        }
-
-        private static bool IsPlaceholderValue(string value)
-        {
-            var trimmed = value.Trim();
-            return (trimmed.StartsWith("%", StringComparison.Ordinal) && trimmed.EndsWith("%", StringComparison.Ordinal)) ||
-                   (trimmed.StartsWith("$", StringComparison.Ordinal) && trimmed.EndsWith("$", StringComparison.Ordinal));
-        }
-
-        private static string NormalizeThumbprint(string thumbprint)
-        {
-            return thumbprint?.Replace(" ", string.Empty).Trim().ToUpperInvariant();
-        }
-
+        /// <summary>
+        /// Gets the configured certificate thumbprint.
+        /// </summary>
+        /// <returns>The normalized certificate thumbprint.</returns>
         private string GetCertificateThumbprint()
         {
-            return NormalizeThumbprint(GetOptionalSetting(CertificateThumbprintKey) ?? GetRequiredSetting(DefaultCertificateKey));
+            return VMConfiguration.NormalizeThumbprint(VMConfiguration.GetOptionalSetting(CertificateThumbprintKey) ?? VMConfiguration.GetRequiredSetting(DefaultCertificateKey));
         }
 
+        /// <summary>
+        /// Gets the configured certificate from the local machine certificate store.
+        /// </summary>
+        /// <param name="thumbprint">The certificate thumbprint.</param>
+        /// <returns>The certificate.</returns>
         private X509Certificate2 GetCertificateFromStore(string thumbprint)
         {
             using (var store = new X509Store(StoreName.My, StoreLocation.LocalMachine))
@@ -195,9 +295,14 @@ namespace Sample.PolicyRecordingBot.FrontEnd
             }
         }
 
+        /// <summary>
+        /// Gets the public IP address used by the media platform.
+        /// </summary>
+        /// <param name="serviceFqdn">The service FQDN to resolve when no IP address is configured.</param>
+        /// <returns>The public IP address.</returns>
         private IPAddress GetPublicIpAddress(string serviceFqdn)
         {
-            var configuredIp = GetOptionalSetting(InstancePublicIpAddressKey);
+            var configuredIp = VMConfiguration.GetOptionalSetting(InstancePublicIpAddressKey);
             if (!string.IsNullOrWhiteSpace(configuredIp))
             {
                 if (IPAddress.TryParse(configuredIp, out var parsedIp))
@@ -217,6 +322,11 @@ namespace Sample.PolicyRecordingBot.FrontEnd
             return resolvedAddress;
         }
 
+        /// <summary>
+        /// Writes a non-secret configuration value to the graph logger.
+        /// </summary>
+        /// <param name="key">The configuration key.</param>
+        /// <param name="value">The configuration value.</param>
         private void TraceConfigValue(string key, object value)
         {
             this.logger.Info($"{key} -> {value}");

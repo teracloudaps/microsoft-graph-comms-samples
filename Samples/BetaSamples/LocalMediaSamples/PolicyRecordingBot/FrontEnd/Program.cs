@@ -28,14 +28,14 @@ namespace Sample.PolicyRecordingBot.FrontEnd
 
             try
             {
-                WriteBanner();
+                Program.WriteBanner();
 
                 configuration = new VMConfiguration(logger);
                 Service.Instance.Initialize(configuration, logger);
                 Service.Instance.Start();
                 serviceStarted = true;
 
-                WriteStartupSummary(configuration);
+                Program.WriteStartupSummary(configuration);
 
                 using (var shutdownSignal = new ManualResetEventSlim(false))
                 {
@@ -60,14 +60,14 @@ namespace Sample.PolicyRecordingBot.FrontEnd
             catch (Exception ex)
             {
                 Console.Error.WriteLine("Startup failed.");
-                WriteException(ex);
+                Program.WriteException(ex);
                 return 1;
             }
             finally
             {
                 if (serviceStarted)
                 {
-                    StopService();
+                    Program.StopService();
                 }
 
                 configuration?.Dispose();
