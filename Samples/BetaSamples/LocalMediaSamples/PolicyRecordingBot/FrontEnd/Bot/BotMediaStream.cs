@@ -79,7 +79,7 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
         private long droppedMetadataMessageCount;
         private DateTime lastStatsLog = DateTime.UtcNow;
         private bool unmixedAudioEnabled;
-        private bool detailedLogging;
+        private bool detailedLogging = false;
         private System.Timers.Timer participantCheckTimer;
         private int participantCheckCount;
 
@@ -517,16 +517,62 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
                     }
                 }
 
-                // Anonymous shadow participants (no userId) are merged into the first
-                // real caller. The mergedParticipantTarget lock prevents subsequent
-                // re-fires of OnParticipantsUpdated from re-merging into a different target.
+                // If a real participant arrives with no MSI in MediaStreams, claim the
+                // oldest unowned MSI-fallback placeholder. This is the reverse of the
+                // dominant-speaker adoption path and covers the timing where audio
+                // arrives first (placeholder created), then identity resolves. Only fires
+                // for identity-resolved real participants — anonymous shadows go through
+                // the merge logic below instead.
+                if (!string.IsNullOrWhiteSpace(userId) && mediaStreamIds.Count == 0)
+                {
+                    var orphanPlaceholder = this.participantsById.Values
+                        .Where(p => p.IsMsiFallback)
+                        .OrderBy(p => p.JoinTime)
+                        .FirstOrDefault();
+
+                    if (orphanPlaceholder != null && orphanPlaceholder.MediaStreamIds != null)
+                    {
+                        foreach (var msi in orphanPlaceholder.MediaStreamIds)
+                        {
+                            mediaStreamIds.Add(msi);
+                        }
+
+                        if (this.participantsById.TryRemove(orphanPlaceholder.ParticipantId, out var evicted))
+                        {
+                            this.SendParticipantEvent(evicted, "LEAVE");
+                            Console.WriteLine($"Claimed MSI placeholder '{evicted.DisplayName}' (was CH{evicted.ChannelId}) for incoming real caller '{displayName}'");
+                        }
+                    }
+                }
+
+                // Anonymous shadow participants (no userId) are merged into a real caller.
+                // The Teams SDK frequently reports a real participant first (with no MSI in
+                // MediaStreams) and then a separate anonymous shadow carrying that participant's
+                // audio MSI. The shadow's most likely owner is therefore a real caller that
+                // doesn't yet have any MSI mapped. Prefer the oldest-joined such caller; fall
+                // back to the most-recently-joined real caller only if all already have MSIs.
+                // mergedParticipantTarget locks the decision so a later OnParticipantsUpdated
+                // re-fire cannot flip the target.
                 if (string.IsNullOrWhiteSpace(userId))
                 {
-                    var mergeTarget = this.participantsById.Values
-                        .FirstOrDefault(p => !p.IsMsiFallback && !string.IsNullOrWhiteSpace(p.UserId));
+                    var realCallers = this.participantsById.Values
+                        .Where(p => !p.IsMsiFallback && !string.IsNullOrWhiteSpace(p.UserId))
+                        .ToList();
+
+                    var mergeTarget = realCallers
+                        .Where(p => p.MediaStreamIds == null || p.MediaStreamIds.Count == 0)
+                        .OrderBy(p => p.JoinTime)
+                        .FirstOrDefault()
+                        ?? realCallers
+                            .OrderByDescending(p => p.JoinTime)
+                            .FirstOrDefault();
 
                     if (mergeTarget != null)
                     {
+                        var heuristic = mergeTarget.MediaStreamIds == null || mergeTarget.MediaStreamIds.Count == 0
+                            ? "no-MSI-yet"
+                            : "most-recent-fallback";
+
                         foreach (var msi in mediaStreamIds)
                         {
                             this.msiToParticipantId[msi] = mergeTarget.ParticipantId;
@@ -536,7 +582,7 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
                             }
                         }
 
-                        Console.WriteLine($" Merged anonymous participant '{participantId}' into '{mergeTarget.DisplayName}'");
+                        Console.WriteLine($" Merged anonymous participant '{participantId}' into '{mergeTarget.DisplayName}' (CH{mergeTarget.ChannelId}) via {heuristic}");
                         this.mergedParticipantTarget.TryAdd(participantId, mergeTarget.ParticipantId);
                         return;
                     }
@@ -607,24 +653,42 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
 
                 if (!this.msiToParticipantId.ContainsKey(e.CurrentDominantSpeaker))
                 {
-                    // Audio MSI arrives before the participant SDK reports the identity.
-                    // Create a placeholder so frames are attributed; the real participant's
-                    // arrival will evict this fallback.
-                    var placeholderId = $"MSI-{e.CurrentDominantSpeaker}";
-                    int channelId = Interlocked.Increment(ref this.nextChannelIndex) - 1;
-                    var placeholder = new ParticipantInfo
+                    // The Teams SDK frequently lights up an audio MSI via the dominant-speaker
+                    // event *before* (or instead of) populating it in the corresponding
+                    // participant's MediaStreams. If a real participant has joined but does
+                    // not yet have any MSI bound, attribute this MSI to them rather than
+                    // building an anonymous "Speaker-N" placeholder. Oldest-joined wins so
+                    // multiple unbound real participants resolve deterministically.
+                    var orphanedRealCaller = this.participantsById.Values
+                        .Where(p => !p.IsMsiFallback && !string.IsNullOrWhiteSpace(p.UserId))
+                        .Where(p => p.MediaStreamIds == null || p.MediaStreamIds.Count == 0)
+                        .OrderBy(p => p.JoinTime)
+                        .FirstOrDefault();
+
+                    if (orphanedRealCaller != null)
                     {
-                        ParticipantId = placeholderId,
-                        DisplayName = $"Speaker-{e.CurrentDominantSpeaker}",
-                        ChannelId = channelId,
-                        IsMsiFallback = true,
-                        MediaStreamIds = new List<uint> { e.CurrentDominantSpeaker },
-                        JoinTime = now,
-                    };
-                    placeholder.FrameMetadataBytes = BuildFrameMetadata(this.currentSessionId, placeholder);
-                    this.msiToParticipantId[e.CurrentDominantSpeaker] = placeholderId;
-                    this.participantsById[placeholderId] = placeholder;
-                    Console.WriteLine($"MSI-FALLBACK: Registered placeholder for MSI {e.CurrentDominantSpeaker} on CH{channelId}");
+                        orphanedRealCaller.MediaStreamIds.Add(e.CurrentDominantSpeaker);
+                        this.msiToParticipantId[e.CurrentDominantSpeaker] = orphanedRealCaller.ParticipantId;
+                        Console.WriteLine($"Adopted MSI {e.CurrentDominantSpeaker} for previously-unbound real caller '{orphanedRealCaller.DisplayName}' (CH{orphanedRealCaller.ChannelId})");
+                    }
+                    else
+                    {
+                        var placeholderId = $"MSI-{e.CurrentDominantSpeaker}";
+                        int channelId = Interlocked.Increment(ref this.nextChannelIndex) - 1;
+                        var placeholder = new ParticipantInfo
+                        {
+                            ParticipantId = placeholderId,
+                            DisplayName = $"Speaker-{e.CurrentDominantSpeaker}",
+                            ChannelId = channelId,
+                            IsMsiFallback = true,
+                            MediaStreamIds = new List<uint> { e.CurrentDominantSpeaker },
+                            JoinTime = now,
+                        };
+                        placeholder.FrameMetadataBytes = BuildFrameMetadata(this.currentSessionId, placeholder);
+                        this.msiToParticipantId[e.CurrentDominantSpeaker] = placeholderId;
+                        this.participantsById[placeholderId] = placeholder;
+                        Console.WriteLine($"MSI-FALLBACK: Registered placeholder for MSI {e.CurrentDominantSpeaker} on CH{channelId}");
+                    }
                 }
 
                 if (this.msiToParticipantId.TryGetValue(e.CurrentDominantSpeaker, out var pid) &&
