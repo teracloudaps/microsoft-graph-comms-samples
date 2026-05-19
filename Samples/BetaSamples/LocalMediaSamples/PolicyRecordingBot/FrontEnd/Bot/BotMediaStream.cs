@@ -509,12 +509,23 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
                 {
                     foreach (var stream in participant.Resource.MediaStreams)
                     {
-                        if (stream.MediaType == Modality.Audio &&
-                            uint.TryParse(stream.SourceId, out uint msi))
+                        if (stream.MediaType != Modality.Audio || !uint.TryParse(stream.SourceId, out uint msi))
                         {
-                            mediaStreamIds.Add(msi);
-                            Console.WriteLine($"  Identity '{displayName}' audio MSI={msi} direction={stream.Direction}");
+                            continue;
                         }
+
+                        // Only the participant's own voice (Send/SendReceive). ReceiveOnly is
+                        // what this participant is hearing from others — attributing it to them
+                        // would route incoming audio to the wrong channel.
+                        if (stream.Direction != MediaDirection.SendOnly &&
+                            stream.Direction != MediaDirection.SendReceive)
+                        {
+                            Console.WriteLine($"  Identity '{displayName}' skipped audio MSI={msi} direction={stream.Direction}");
+                            continue;
+                        }
+
+                        mediaStreamIds.Add(msi);
+                        Console.WriteLine($"  Identity '{displayName}' audio MSI={msi} direction={stream.Direction}");
                     }
                 }
 
