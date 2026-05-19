@@ -292,6 +292,11 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
             this.StopCommandServer();
         }
 
+        private static string EscapeJsonString(string s)
+        {
+            return s.Replace("\\", "\\\\").Replace("\"", "\\\"");
+        }
+
         private void CheckForParticipants(object sender, System.Timers.ElapsedEventArgs e)
         {
             try
@@ -1026,10 +1031,14 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
             // IAB1 frame: magic(4) + metadataLen(4) + audioLen(4) + metadata + audio
             var frame = new byte[12 + metadataBytes.Length + audioData.Length];
             int offset = 0;
-            Buffer.BlockCopy(Iab1Magic, 0, frame, offset, 4); offset += 4;
-            Buffer.BlockCopy(BitConverter.GetBytes((uint)metadataBytes.Length), 0, frame, offset, 4); offset += 4;
-            Buffer.BlockCopy(BitConverter.GetBytes((uint)audioData.Length), 0, frame, offset, 4); offset += 4;
-            Buffer.BlockCopy(metadataBytes, 0, frame, offset, metadataBytes.Length); offset += metadataBytes.Length;
+            Buffer.BlockCopy(Iab1Magic, 0, frame, offset, 4);
+            offset += 4;
+            Buffer.BlockCopy(BitConverter.GetBytes((uint)metadataBytes.Length), 0, frame, offset, 4);
+            offset += 4;
+            Buffer.BlockCopy(BitConverter.GetBytes((uint)audioData.Length), 0, frame, offset, 4);
+            offset += 4;
+            Buffer.BlockCopy(metadataBytes, 0, frame, offset, metadataBytes.Length);
+            offset += metadataBytes.Length;
             Buffer.BlockCopy(audioData, 0, frame, offset, audioData.Length);
 
             this.SendToClients(frame);
@@ -1066,11 +1075,6 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
             sb.AppendFormat("\"isInternal\":{0}", participant?.IsInternal == true ? "true" : "false");
             sb.Append("}");
             return sb.ToString();
-        }
-
-        private static string EscapeJsonString(string s)
-        {
-            return s.Replace("\\", "\\\\").Replace("\"", "\\\"");
         }
 
         private double CalculateAudioEnergy(byte[] audioData)
