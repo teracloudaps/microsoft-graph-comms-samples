@@ -37,11 +37,6 @@ namespace Sample.PolicyRecordingBot.FrontEnd
         private const string AadAppSecretKey = "AadAppSecret";
 
         /// <summary>
-        /// App setting key for the optional tenant id emitted in metadata.
-        /// </summary>
-        private const string HomeTenantIdKey = "HomeTenantId";
-
-        /// <summary>
         /// App setting key for the Microsoft Graph base endpoint.
         /// </summary>
         private const string PlaceCallEndpointUrlKey = "PlaceCallEndpointUrl";
@@ -138,9 +133,6 @@ namespace Sample.PolicyRecordingBot.FrontEnd
 
         /// <inheritdoc/>
         public string AadAppSecret { get; private set; }
-
-        /// <inheritdoc/>
-        public string HomeTenantId { get; private set; }
 
         /// <inheritdoc/>
         public MediaPlatformSettings MediaPlatformSettings { get; private set; }
@@ -258,7 +250,6 @@ namespace Sample.PolicyRecordingBot.FrontEnd
             this.ServiceDnsName = VMConfiguration.GetRequiredSetting(ServiceDnsNameKey);
             this.AadAppId = VMConfiguration.GetRequiredSetting(AadAppIdKey);
             this.AadAppSecret = VMConfiguration.GetRequiredSetting(AadAppSecretKey);
-            this.HomeTenantId = VMConfiguration.GetOptionalSetting(HomeTenantIdKey)?.Trim();
 
             var callControlPort = VMConfiguration.GetIntSetting(CallControlPortKey, DefaultCallControlPort);
             var mediaPort = VMConfiguration.GetIntSetting(MediaPortKey, DefaultMediaPort);

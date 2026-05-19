@@ -37,21 +37,9 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
         private int recordingStatusIndex = -1;
         private int participantsCount = 0;
 
-        public CallHandler(
-            ICall statefulCall,
-            string configuredOrgId = null,
-            string agentUserId = null,
-            string agentDisplayName = null)
+        public CallHandler(ICall statefulCall)
             : base(TimeSpan.FromMinutes(1), statefulCall?.GraphLogger)
         {
-            var effectiveAgentUserId = string.IsNullOrWhiteSpace(agentUserId)
-                ? (Environment.GetEnvironmentVariable("AGENT_USER_ID") ?? string.Empty).Trim()
-                : agentUserId.Trim();
-
-            var effectiveAgentDisplayName = string.IsNullOrWhiteSpace(agentDisplayName)
-                ? (Environment.GetEnvironmentVariable("AGENT_DISPLAY_NAME") ?? string.Empty).Trim()
-                : agentDisplayName.Trim();
-
             this.Call = statefulCall;
             this.Call.OnUpdated += this.CallOnUpdated;
 
@@ -59,11 +47,7 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
             this.Call.ParticipantLeftHandler += this.ParticipantLeft;
             this.Call.ParticipantJoiningHandler += this.ParticipantJoining;
 
-            Console.WriteLine($"CallHandler for agent: {effectiveAgentDisplayName} ({effectiveAgentUserId})");
-            if (string.IsNullOrWhiteSpace(effectiveAgentUserId))
-            {
-                Console.WriteLine(" AGENT_USER_ID resolved to empty. Agent may be classified as CALLER.");
-            }
+            Console.WriteLine($"CallHandler created for call {this.Call.Id}");
 
             if (this.Call.Resource != null)
             {
@@ -104,14 +88,7 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
 
             var mediaSession = this.Call.GetLocalMediaSession();
 
-            // Create BotMediaStream
-            this.BotMediaStream = new BotMediaStream(
-                mediaSession,
-                this.GraphLogger,
-                this.Call,
-                effectiveAgentUserId,
-                effectiveAgentDisplayName,
-                configuredOrgId);
+            this.BotMediaStream = new BotMediaStream(mediaSession, this.GraphLogger, this.Call);
 
             if (this.Call.Participants.Count > 0)
             {

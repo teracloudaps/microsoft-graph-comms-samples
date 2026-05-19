@@ -81,11 +81,6 @@ namespace Sample.PolicyRecordingBot.WorkerRole
         private const string AadAppSecretKey = "AadAppSecret";
 
         /// <summary>
-        /// The configured home tenant id key.
-        /// </summary>
-        private const string HomeTenantIdKey = "HomeTenantId";
-
-        /// <summary>
         /// The default Microsoft app id value.
         /// </summary>
         private const string DefaultAadAppIdValue = "$AadAppId$";
@@ -149,9 +144,6 @@ namespace Sample.PolicyRecordingBot.WorkerRole
         /// <inheritdoc/>
         public string AadAppSecret { get; private set; }
 
-        /// <inheritdoc/>
-        public string HomeTenantId { get; private set; }
-
         /// <summary>
         /// Initialize from serviceConfig.
         /// </summary>
@@ -200,8 +192,6 @@ namespace Sample.PolicyRecordingBot.WorkerRole
             {
                 throw new ConfigurationException("AadAppSecret", "Update app.config in WorkerRole with BotSecret from the bot registration portal");
             }
-
-            this.HomeTenantId = this.GetString(HomeTenantIdKey, true)?.Trim();
 
             List<Uri> controlListenUris = new List<Uri>();
             if (RoleEnvironment.IsEmulated)

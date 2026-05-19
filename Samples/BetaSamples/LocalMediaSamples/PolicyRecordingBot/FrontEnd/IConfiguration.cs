@@ -65,11 +65,6 @@ namespace Sample.PolicyRecordingBot.FrontEnd
         string AadAppSecret { get; }
 
         /// <summary>
-        /// Gets the configured org or tenant identifier emitted with participant metadata.
-        /// </summary>
-        string HomeTenantId { get; }
-
-        /// <summary>
         /// Gets the Settings for the bot media platform.
         /// </summary>
         MediaPlatformSettings MediaPlatformSettings { get; }

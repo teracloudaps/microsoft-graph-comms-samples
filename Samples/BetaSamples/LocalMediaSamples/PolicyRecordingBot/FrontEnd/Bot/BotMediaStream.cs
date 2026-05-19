@@ -14,13 +14,11 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
     using System.Linq;
     using System.Net;
     using System.Net.Sockets;
-    using System.Runtime.Remoting.Metadata.W3cXsd2001;
-    using System.Security.Cryptography;
     using System.Text;
+    using System.Threading;
     using System.Threading.Tasks;
     using System.Timers;
     using Microsoft.Graph.Beta.Models;
-    using Microsoft.Graph.Beta.Models.TermStore;
     using Microsoft.Graph.Communications.Calls;
     using Microsoft.Graph.Communications.Calls.Media;
     using Microsoft.Graph.Communications.Common;
@@ -30,7 +28,10 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
     using Microsoft.Skype.Internal.Media.Services.Common;
 
     /// <summary>
-    /// Handles media socket events and forwards real-time audio plus participant metadata to local TCP consumers.
+    /// Receives audio frames and participant updates from the Teams media SDK and relays
+    /// them to local TCP consumers. The bot performs no business classification (agent
+    /// vs. caller, internal vs. external, etc.) — it forwards raw identity data only,
+    /// and the consumer decides how to route.
     /// </summary>
     internal class BotMediaStream : ObjectRootDisposable
     {
@@ -40,8 +41,12 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
         private const double SPEAKERCHANGEDEBOUNCEMS = 500;
         private const int MAXQUEUEDAUDIOFRAMES = 200;
         private const int MAXQUEUEDMETADATAMESSAGES = 100;
+        private const int IAB1HEADERLEN = 12;
+        private const int AUDIOSTREAMPORT = 5001;
+        private const int METADATASTREAMPORT = 5002;
 
         private static readonly byte[] Iab1Magic = { 0x49, 0x41, 0x42, 0x31 }; // "IAB1"
+        private static readonly char[] HexDigits = "0123456789abcdef".ToCharArray();
 
         private readonly IAudioSocket audioSocket;
         private readonly IVideoSocket vbssSocket;
@@ -52,50 +57,29 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
         private readonly BlockingCollection<byte[]> metadataMessageQueue = new BlockingCollection<byte[]>(MAXQUEUEDMETADATAMESSAGES);
         private readonly ConcurrentDictionary<TcpClient, byte> connectedClients = new ConcurrentDictionary<TcpClient, byte>();
         private readonly ConcurrentDictionary<TcpClient, byte> connectedMetadataClients = new ConcurrentDictionary<TcpClient, byte>();
+        private readonly ConcurrentDictionary<string, ParticipantInfo> participantsById = new ConcurrentDictionary<string, ParticipantInfo>();
+        private readonly ConcurrentDictionary<uint, string> msiToParticipantId = new ConcurrentDictionary<uint, string>();
+        private readonly ConcurrentDictionary<string, string> mergedParticipantTarget = new ConcurrentDictionary<string, string>();
+        private readonly string currentSessionId = Guid.NewGuid().ToString();
+        private readonly byte[] fallbackFrameMetadataBytes;
+        private readonly Queue<double> recentAudioEnergy = new Queue<double>();
+        private readonly CancellationTokenSource shutdownCts = new CancellationTokenSource();
+
         private TcpListener audioStreamServer;
         private TcpListener metadataStreamServer;
-        private TcpListener commandServer;
-        private string currentSessionId = Guid.NewGuid().ToString();
-        private string agentUserId;
-        private string agentDisplayName;
-        private string configuredOrgId;
-        private string orgTenantId;
-
-        // Unmixed audio tracking
-        private bool unmixedAudioEnabled = false;
-        private int unmixedPacketCount = 0;
-        private int mixedPacketCount = 0;
-
-        // Enhanced participant tracking
-        private ConcurrentDictionary<string, ParticipantInfo> participantsById =
-            new ConcurrentDictionary<string, ParticipantInfo>();
-
-        private ConcurrentDictionary<uint, string> msiToParticipantId =
-            new ConcurrentDictionary<uint, string>();
-
-        // Enhanced speaker detection
-        private uint? currentDominantSpeakerMsi = null;
-        private uint? previousDominantSpeakerMsi = null;
+        private int nextChannelIndex; // Atomic; monotonic; never reused after a participant leaves
+        private uint? currentDominantSpeakerMsi;
         private DateTime lastSpeakerChangeTime = DateTime.UtcNow;
-
-        // Speaker persistence
-        private string lastKnownSpeakerId = null;
+        private string lastKnownSpeakerId;
         private DateTime lastKnownSpeakerTime = DateTime.UtcNow;
-
-        // Audio energy detection
-        private Queue<double> recentAudioEnergy = new Queue<double>();
-
-        // Statistics
-        private int agentPacketCount = 0;
-        private int callerPacketCount = 0;
-        private int unknownPacketCount = 0;
-        private int silencePacketCount = 0;
-        private int droppedAudioFrameCount = 0;
-        private int droppedMetadataMessageCount = 0;
+        private long mixedPacketCount;
+        private long unmixedPacketCount;
+        private long silencePacketCount;
+        private long droppedAudioFrameCount;
+        private long droppedMetadataMessageCount;
         private DateTime lastStatsLog = DateTime.UtcNow;
-
-        // Detailed logging
-        private bool detailedLogging = false;
+        private bool unmixedAudioEnabled;
+        private bool detailedLogging;
         private System.Timers.Timer participantCheckTimer;
         private int participantCheckCount;
 
@@ -105,16 +89,7 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
         /// <param name="mediaSession">The local media session.</param>
         /// <param name="logger">The graph logger.</param>
         /// <param name="call">The active call.</param>
-        /// <param name="agentUserId">The configured agent user id.</param>
-        /// <param name="agentDisplayName">The configured agent display name.</param>
-        /// <param name="configuredOrgId">The configured org or tenant id to emit as metadata.</param>
-        public BotMediaStream(
-            ILocalMediaSession mediaSession,
-            IGraphLogger logger,
-            ICall call,
-            string agentUserId = null,
-            string agentDisplayName = null,
-            string configuredOrgId = null)
+        public BotMediaStream(ILocalMediaSession mediaSession, IGraphLogger logger, ICall call)
             : base(logger)
         {
             ArgumentVerifier.ThrowOnNullArgument(mediaSession, nameof(mediaSession));
@@ -123,13 +98,8 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
 
             this.mediaSession = mediaSession;
             this.call = call;
-            this.agentUserId = agentUserId;
-            this.agentDisplayName = agentDisplayName;
-            this.configuredOrgId = configuredOrgId;
+            this.fallbackFrameMetadataBytes = BuildFallbackFrameMetadata(this.currentSessionId);
 
-            Console.WriteLine($"Agent for this recording: {this.agentDisplayName} ({this.agentUserId})");
-
-            // Subscribe to audio media
             this.audioSocket = mediaSession.AudioSocket;
             if (this.audioSocket == null)
             {
@@ -138,10 +108,8 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
 
             this.audioSocket.AudioMediaReceived += this.OnAudioMediaReceived;
             this.audioSocket.DominantSpeakerChanged += this.OnDominantSpeakerChanged;
+            Console.WriteLine("Subscribed to AudioMediaReceived and DominantSpeakerChanged events");
 
-            Console.WriteLine($"Subscribed to AudioMediaReceived and DominantSpeakerChanged events");
-
-            // Subscribe to video
             this.videoSockets = this.mediaSession.VideoSockets?.ToList();
             if (this.videoSockets?.Any() == true)
             {
@@ -154,31 +122,22 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
                 this.mediaSession.VbssSocket.VideoMediaReceived += this.OnVbssMediaReceived;
             }
 
-            // Subscribe to participant events
             this.call.Participants.OnUpdated += this.OnParticipantsUpdated;
 
-            // Process existing participants
             Console.WriteLine($"Initial participants: {this.call.Participants.Count}");
             foreach (var participant in this.call.Participants)
             {
                 this.ProcessParticipant(participant, isNew: false);
             }
 
-            this.participantCheckTimer = new System.Timers.Timer(1000);
-            this.participantCheckTimer.AutoReset = true;
+            this.participantCheckTimer = new System.Timers.Timer(1000) { AutoReset = true };
             this.participantCheckTimer.Elapsed += this.CheckForParticipants;
             this.participantCheckTimer.Start();
-            Console.WriteLine($"Started participant polling timer");
+            Console.WriteLine("Started participant polling timer");
 
             this.StartAudioStreamServer();
             this.StartMetadataStreamServer();
-            this.StartCommandServer();
         }
-
-        /// <summary>
-        /// Gets the configured agent user id.
-        /// </summary>
-        public string AgentUserId => this.agentUserId;
 
         /// <summary>
         /// Registers a participant discovered by the call handler.
@@ -196,7 +155,7 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
                 }
                 else
                 {
-                    Console.WriteLine($"Participant already tracked");
+                    Console.WriteLine("Participant already tracked");
                 }
             }
             catch (Exception ex)
@@ -228,7 +187,7 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
             }
             catch (Exception ex)
             {
-                this.GraphLogger.Error(ex, $"Video subscription failed");
+                this.GraphLogger.Error(ex, "Video subscription failed");
             }
         }
 
@@ -253,7 +212,7 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
             }
             catch (Exception ex)
             {
-                this.GraphLogger.Error(ex, $"Unsubscribing failed");
+                this.GraphLogger.Error(ex, "Unsubscribing failed");
             }
         }
 
@@ -261,6 +220,8 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
         protected override void Dispose(bool disposing)
         {
             base.Dispose(disposing);
+
+            this.shutdownCts.Cancel();
 
             if (this.participantCheckTimer != null)
             {
@@ -289,21 +250,133 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
 
             this.StopAudioStreamServer();
             this.StopMetadataStreamServer();
-            this.StopCommandServer();
+            this.shutdownCts.Dispose();
         }
 
-        private static string EscapeJsonString(string s)
+        private static byte[] BuildFallbackFrameMetadata(string sessionId)
         {
-            return s.Replace("\\", "\\\\").Replace("\"", "\\\"");
+            var sb = new StringBuilder(64);
+            sb.Append('{');
+            AppendJsonString(sb, "callId", sessionId);
+            sb.Append(',');
+            AppendJsonString(sb, "streamId", "unknown");
+            sb.Append('}');
+            return Encoding.UTF8.GetBytes(sb.ToString());
         }
 
-        private void CheckForParticipants(object sender, System.Timers.ElapsedEventArgs e)
+        private static byte[] BuildFrameMetadata(string sessionId, ParticipantInfo info)
+        {
+            var sb = new StringBuilder(192);
+            sb.Append('{');
+            AppendJsonString(sb, "callId", sessionId);
+            sb.Append(',');
+            AppendJsonString(sb, "streamId", info.ParticipantId);
+            sb.Append(',');
+            AppendJsonString(sb, "participantId", info.ParticipantId);
+            sb.Append(',');
+            AppendJsonString(sb, "userId", info.UserId ?? string.Empty);
+            sb.Append(',');
+            AppendJsonString(sb, "displayName", info.DisplayName ?? string.Empty);
+            sb.Append(',');
+            AppendJsonString(sb, "tenantId", info.TenantId ?? string.Empty);
+            sb.Append(',');
+            sb.Append("\"channelId\":").Append(info.ChannelId);
+            sb.Append(',');
+            sb.Append("\"isMsiFallback\":").Append(info.IsMsiFallback ? "true" : "false");
+            sb.Append('}');
+            return Encoding.UTF8.GetBytes(sb.ToString());
+        }
+
+        private static string BuildParticipantEventJson(string sessionId, ParticipantInfo info, string eventType)
+        {
+            var sb = new StringBuilder(256);
+            sb.Append('{');
+            AppendJsonString(sb, "eventType", eventType);
+            sb.Append(',');
+            AppendJsonString(sb, "sessionId", sessionId);
+            sb.Append(',');
+            AppendJsonString(sb, "timestamp", DateTime.UtcNow.ToString("o"));
+            sb.Append(',');
+            AppendJsonString(sb, "participantId", info.ParticipantId ?? string.Empty);
+            sb.Append(',');
+            AppendJsonString(sb, "userId", info.UserId ?? string.Empty);
+            sb.Append(',');
+            AppendJsonString(sb, "displayName", info.DisplayName ?? string.Empty);
+            sb.Append(',');
+            AppendJsonString(sb, "tenantId", info.TenantId ?? string.Empty);
+            sb.Append(',');
+            sb.Append("\"channelId\":").Append(info.ChannelId);
+            sb.Append(',');
+            sb.Append("\"isMsiFallback\":").Append(info.IsMsiFallback ? "true" : "false");
+            sb.Append(',');
+            sb.Append("\"mediaStreamIds\":[");
+            var first = true;
+            foreach (var msi in info.MediaStreamIds)
+            {
+                if (!first)
+                {
+                    sb.Append(',');
+                }
+
+                sb.Append(msi);
+                first = false;
+            }
+
+            sb.Append(']');
+            sb.Append('}');
+            return sb.ToString();
+        }
+
+        private static void AppendJsonString(StringBuilder sb, string name, string value)
+        {
+            sb.Append('"').Append(name).Append("\":");
+            AppendEscapedJsonString(sb, value);
+        }
+
+        private static void AppendEscapedJsonString(StringBuilder sb, string value)
+        {
+            sb.Append('"');
+            if (!string.IsNullOrEmpty(value))
+            {
+                for (int i = 0; i < value.Length; i++)
+                {
+                    var c = value[i];
+                    switch (c)
+                    {
+                        case '\\': sb.Append("\\\\"); break;
+                        case '"': sb.Append("\\\""); break;
+                        case '\b': sb.Append("\\b"); break;
+                        case '\f': sb.Append("\\f"); break;
+                        case '\n': sb.Append("\\n"); break;
+                        case '\r': sb.Append("\\r"); break;
+                        case '\t': sb.Append("\\t"); break;
+                        default:
+                            if (c < 0x20)
+                            {
+                                sb.Append("\\u00")
+                                  .Append(HexDigits[(c >> 4) & 0xF])
+                                  .Append(HexDigits[c & 0xF]);
+                            }
+                            else
+                            {
+                                sb.Append(c);
+                            }
+
+                            break;
+                    }
+                }
+            }
+
+            sb.Append('"');
+        }
+
+        private void CheckForParticipants(object sender, ElapsedEventArgs e)
         {
             try
             {
                 this.participantCheckCount++;
 
-                if (this.call?.Participants != null && this.participantsById.Count == 0)
+                if (this.call?.Participants != null && this.participantsById.IsEmpty)
                 {
                     try
                     {
@@ -324,16 +397,15 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
                     }
                 }
 
-                // Stop when we find participants OR after reasonable attempts
-                if (this.participantsById.Count > 0 || this.participantCheckCount > 30)
+                if (!this.participantsById.IsEmpty || this.participantCheckCount > 30)
                 {
-                    if (this.participantsById.Count > 0)
+                    if (!this.participantsById.IsEmpty)
                     {
                         Console.WriteLine($"Successfully tracked {this.participantsById.Count} participant(s) - stopping polling");
                     }
                     else
                     {
-                        Console.WriteLine($"No participants found after 30 checks - relying on MSI fallback");
+                        Console.WriteLine("No participants found after 30 checks - relying on MSI fallback");
                     }
 
                     this.participantCheckTimer?.Stop();
@@ -357,14 +429,13 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
                         continue;
                     }
 
-                    Console.WriteLine($"Participant JOINED");
+                    Console.WriteLine("Participant JOINED");
                     this.ProcessParticipant(participant, isNew: true);
                 }
 
                 foreach (var participant in args.RemovedResources)
                 {
                     var participantId = participant.Id;
-
                     if (this.participantsById.TryRemove(participantId, out var info))
                     {
                         foreach (var msi in info.MediaStreamIds)
@@ -372,9 +443,8 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
                             this.msiToParticipantId.TryRemove(msi, out _);
                         }
 
-                        Console.WriteLine($"Participant LEFT: {info.DisplayName} ({info.Role})");
-
-                        this.SendParticipantMetadata(info, "LEAVE");
+                        Console.WriteLine($"Participant LEFT: {info.DisplayName} (CH{info.ChannelId})");
+                        this.SendParticipantEvent(info, "LEAVE");
 
                         if (this.lastKnownSpeakerId == participantId)
                         {
@@ -396,78 +466,44 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
             try
             {
                 var participantId = participant.Id;
-                var identity = participant.Resource?.Info?.Identity;
 
+                if (this.mergedParticipantTarget.ContainsKey(participantId))
+                {
+                    return;
+                }
+
+                var identity = participant.Resource?.Info?.Identity;
                 if (identity == null)
                 {
                     Console.WriteLine($" Participant {participantId} has no identity");
                     return;
                 }
 
-                // Skip bot itself
                 if (identity.Application != null)
                 {
-                    Console.WriteLine($" Skipping bot participant");
+                    Console.WriteLine(" Skipping bot participant");
                     return;
                 }
 
-                string displayName = "Unknown";
+                string displayName;
                 string userId = null;
-                bool isAgent = false;
-                string participantTenantId = "unknown";
-                string callerType = "EXTERNAL_TEAMS";
+                string tenantId = null;
 
                 if (identity.User != null)
                 {
                     displayName = identity.User.DisplayName ?? "Teams User";
                     userId = identity.User.Id;
-                    isAgent = this.IsAgentParticipant(userId, participantId, displayName);
-
                     if (identity.User.AdditionalData != null &&
-                        identity.User.AdditionalData.TryGetValue("tenantId", out object tenantObj))
+                        identity.User.AdditionalData.TryGetValue("tenantId", out var tenantObj))
                     {
-                        participantTenantId = (tenantObj?.ToString() ?? "unknown").Trim().ToLowerInvariant();
-                    }
-
-                    callerType = isAgent ? "AGENT" : "EXTERNAL_TEAMS";
-
-                    // Capture org tenant from agent so we can classify internal callers
-                    if (isAgent && string.IsNullOrEmpty(this.orgTenantId) && participantTenantId != "unknown")
-                    {
-                        this.orgTenantId = participantTenantId;
-                        Console.WriteLine($"Org tenant ID set from agent: {this.orgTenantId}");
-                        this.ReclassifyTrackedParticipantsForOrgTenant();
-                    }
-
-                    // If same tenant as org, classify as internal for metadata.
-                    if (!isAgent && !string.IsNullOrEmpty(this.orgTenantId) &&
-                        participantTenantId != "unknown" && participantTenantId == this.orgTenantId)
-                    {
-                        callerType = "INTERNAL";
+                        tenantId = tenantObj?.ToString()?.Trim();
                     }
                 }
                 else
                 {
                     displayName = "External Caller";
-
-                    if (identity.AdditionalData != null)
-                    {
-                        if (identity.AdditionalData.ContainsKey("phone"))
-                        {
-                            callerType = "PSTN";
-                        }
-                        else if (identity.AdditionalData.ContainsKey("guest"))
-                        {
-                            callerType = "GUEST";
-                        }
-                    }
                 }
 
-                string role = isAgent ? "AGENT" : "CALLER";
-                byte channelId = isAgent ? (byte)1 : (byte)0;
-                bool isInternal = isAgent || callerType == "INTERNAL";
-
-                // Extract MSI values from media streams
                 var mediaStreamIds = new List<uint>();
                 if (participant.Resource.MediaStreams != null)
                 {
@@ -477,73 +513,71 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
                             uint.TryParse(stream.SourceId, out uint msi))
                         {
                             mediaStreamIds.Add(msi);
-                            this.msiToParticipantId[msi] = participantId;
-                            Console.WriteLine($"Mapped MSI {msi} to {participantId} ({role})");
                         }
                     }
                 }
 
-                // If this is an anonymous/non-user caller but we already have a real caller on CH0,
-                // merge MSI mappings into the real caller and suppress duplicate placeholder join.
-                if (!isAgent && string.IsNullOrWhiteSpace(userId))
+                // Anonymous shadow participants (no userId) are merged into the first
+                // real caller. The mergedParticipantTarget lock prevents subsequent
+                // re-fires of OnParticipantsUpdated from re-merging into a different target.
+                if (string.IsNullOrWhiteSpace(userId))
                 {
-                    var existingRealCaller = this.participantsById.Values.FirstOrDefault(
-                        p => !p.IsAgent && p.ChannelId == 0 && !string.IsNullOrWhiteSpace(p.UserId));
+                    var mergeTarget = this.participantsById.Values
+                        .FirstOrDefault(p => !p.IsMsiFallback && !string.IsNullOrWhiteSpace(p.UserId));
 
-                    if (existingRealCaller != null)
+                    if (mergeTarget != null)
                     {
                         foreach (var msi in mediaStreamIds)
                         {
-                            this.msiToParticipantId[msi] = existingRealCaller.ParticipantId;
-                            if (!existingRealCaller.MediaStreamIds.Contains(msi))
+                            this.msiToParticipantId[msi] = mergeTarget.ParticipantId;
+                            if (!mergeTarget.MediaStreamIds.Contains(msi))
                             {
-                                existingRealCaller.MediaStreamIds.Add(msi);
+                                mergeTarget.MediaStreamIds.Add(msi);
                             }
                         }
 
-                        Console.WriteLine($" Merged anonymous participant '{participantId}' into real caller '{existingRealCaller.DisplayName}'");
+                        Console.WriteLine($" Merged anonymous participant '{participantId}' into '{mergeTarget.DisplayName}'");
+                        this.mergedParticipantTarget.TryAdd(participantId, mergeTarget.ParticipantId);
                         return;
                     }
                 }
 
-                var participantInfo = new ParticipantInfo
+                int channelId = Interlocked.Increment(ref this.nextChannelIndex) - 1;
+
+                var info = new ParticipantInfo
                 {
                     ParticipantId = participantId,
                     UserId = userId,
                     DisplayName = displayName,
-                    Role = role,
+                    TenantId = tenantId,
                     ChannelId = channelId,
-                    IsAgent = isAgent,
-                    CallerType = callerType,
-                    IsInternal = isInternal,
-                    TenantId = participantTenantId,
-                    ConfiguredOrgId = this.configuredOrgId,
                     MediaStreamIds = mediaStreamIds,
                     JoinTime = DateTime.UtcNow,
                 };
+                info.FrameMetadataBytes = BuildFrameMetadata(this.currentSessionId, info);
 
-                // Evict any MSI-fallback or anonymous placeholder on the same channel
-                foreach (var kvp in this.participantsById)
+                // Re-bind MSIs to this real participant; evict any MSI-fallback placeholder
+                // that previously held the same MSI.
+                foreach (var msi in mediaStreamIds)
                 {
-                    if (kvp.Key != participantId && kvp.Value.ChannelId == channelId &&
-                        (kvp.Value.IsMsiFallback || kvp.Value.UserId == null))
+                    if (this.msiToParticipantId.TryGetValue(msi, out var existingId) &&
+                        existingId != participantId &&
+                        this.participantsById.TryGetValue(existingId, out var existing) &&
+                        existing.IsMsiFallback)
                     {
-                        if (this.participantsById.TryRemove(kvp.Key, out var evicted))
+                        if (this.participantsById.TryRemove(existingId, out var evicted))
                         {
-                            Console.WriteLine($"Evicted placeholder '{evicted.DisplayName}' (channel {channelId}); replaced by '{displayName}'");
-                            this.SendParticipantMetadata(evicted, "LEAVE");
+                            Console.WriteLine($"Evicted MSI fallback '{evicted.DisplayName}' (CH{evicted.ChannelId}) — superseded by '{displayName}'");
+                            this.SendParticipantEvent(evicted, "LEAVE");
                         }
                     }
+
+                    this.msiToParticipantId[msi] = participantId;
+                    Console.WriteLine($"Mapped MSI {msi} to {participantId} (CH{channelId})");
                 }
 
-                this.participantsById[participantId] = participantInfo;
-                this.SendParticipantMetadata(participantInfo, "JOIN");
-
-                if (isAgent && this.lastKnownSpeakerId == null)
-                {
-                    this.lastKnownSpeakerId = participantId;
-                    Console.WriteLine($"Set as initial speaker (agent)");
-                }
+                this.participantsById[participantId] = info;
+                this.SendParticipantEvent(info, "JOIN");
             }
             catch (Exception ex)
             {
@@ -551,194 +585,57 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
             }
         }
 
-        private void ReclassifyTrackedParticipantsForOrgTenant()
-        {
-            if (string.IsNullOrWhiteSpace(this.orgTenantId))
-            {
-                return;
-            }
-
-            foreach (var kvp in this.participantsById)
-            {
-                var info = kvp.Value;
-                if (info == null || info.IsAgent)
-                {
-                    continue;
-                }
-
-                if (!string.IsNullOrWhiteSpace(info.TenantId) &&
-                    info.TenantId != "unknown" &&
-                    info.TenantId == this.orgTenantId &&
-                    info.CallerType != "INTERNAL")
-                {
-                    info.CallerType = "INTERNAL";
-                    info.IsInternal = true;
-                    Console.WriteLine($"Reclassified participant as INTERNAL: {info.DisplayName} ({info.UserId ?? info.ParticipantId})");
-                    this.SendParticipantMetadata(info, "UPDATE");
-                }
-            }
-        }
-
-        private bool IsAgentParticipant(string participantUserId, string participantId, string participantDisplayName)
-        {
-            var configuredAgentId = this.NormalizeIdentityValue(this.agentUserId);
-            var userId = this.NormalizeIdentityValue(participantUserId);
-            var pId = this.NormalizeIdentityValue(participantId);
-
-            if (!string.IsNullOrWhiteSpace(configuredAgentId))
-            {
-                if (configuredAgentId == userId || configuredAgentId == pId)
-                {
-                    return true;
-                }
-
-                var rawConfiguredAgent = (this.agentUserId ?? string.Empty).Trim().ToLowerInvariant();
-                var rawParticipantUser = (participantUserId ?? string.Empty).Trim().ToLowerInvariant();
-
-                if (!string.IsNullOrWhiteSpace(userId) && rawConfiguredAgent.Contains(userId))
-                {
-                    return true;
-                }
-
-                if (!string.IsNullOrWhiteSpace(configuredAgentId) && rawParticipantUser.Contains(configuredAgentId))
-                {
-                    return true;
-                }
-            }
-
-            if (!string.IsNullOrWhiteSpace(this.agentDisplayName) && !string.IsNullOrWhiteSpace(participantDisplayName) &&
-                string.Equals(this.agentDisplayName.Trim(), participantDisplayName.Trim(), StringComparison.OrdinalIgnoreCase))
-            {
-                Console.WriteLine($"Agent identified by display-name fallback: '{participantDisplayName}'");
-                return true;
-            }
-
-            return false;
-        }
-
-        private string NormalizeIdentityValue(string value)
-        {
-            if (string.IsNullOrWhiteSpace(value))
-            {
-                return null;
-            }
-
-            var normalized = value.Trim().ToLowerInvariant();
-
-            if (normalized.StartsWith("8:orgid:"))
-            {
-                normalized = normalized.Substring("8:orgid:".Length);
-            }
-            else if (normalized.StartsWith("8:teamsvisitor:"))
-            {
-                normalized = normalized.Substring("8:teamsvisitor:".Length);
-            }
-            else if (normalized.StartsWith("8:"))
-            {
-                normalized = normalized.Substring(2);
-            }
-
-            if (Guid.TryParse(normalized, out Guid parsedGuid))
-            {
-                return parsedGuid.ToString("D").ToLowerInvariant();
-            }
-
-            var parts = normalized.Split(':');
-            if (parts.Length > 1)
-            {
-                var last = parts[parts.Length - 1];
-                if (Guid.TryParse(last, out Guid lastGuid))
-                {
-                    return lastGuid.ToString("D").ToLowerInvariant();
-                }
-            }
-
-            return normalized;
-        }
-
         private void OnDominantSpeakerChanged(object sender, DominantSpeakerChangedEventArgs e)
         {
             try
             {
                 var now = DateTime.UtcNow;
-                var timeSinceLastChange = (now - this.lastSpeakerChangeTime).TotalMilliseconds;
-
-                if (timeSinceLastChange < SPEAKERCHANGEDEBOUNCEMS &&
-                    this.currentDominantSpeakerMsi.HasValue)
+                var elapsed = (now - this.lastSpeakerChangeTime).TotalMilliseconds;
+                if (elapsed < SPEAKERCHANGEDEBOUNCEMS && this.currentDominantSpeakerMsi.HasValue)
                 {
-                    if (this.detailedLogging)
-                    {
-                        Console.WriteLine($"Ignoring speaker change (debounce: {timeSinceLastChange:F0}ms)");
-                    }
-
                     return;
                 }
 
-                this.previousDominantSpeakerMsi = this.currentDominantSpeakerMsi;
-
-                if (e.CurrentDominantSpeaker != DominantSpeakerChangedEventArgs.None)
-                {
-                    this.currentDominantSpeakerMsi = e.CurrentDominantSpeaker;
-                    this.lastSpeakerChangeTime = now;
-
-                    if (!this.msiToParticipantId.ContainsKey(e.CurrentDominantSpeaker))
-                    {
-                        bool isFirstMsi = this.msiToParticipantId.Count == 0;
-                        string fakeParticipantId = $"MSI-{e.CurrentDominantSpeaker}";
-                        this.msiToParticipantId[e.CurrentDominantSpeaker] = fakeParticipantId;
-
-                        var participantInfo = new ParticipantInfo
-                        {
-                            ParticipantId = fakeParticipantId,
-                            UserId = isFirstMsi ? this.agentUserId : null,
-                            DisplayName = isFirstMsi ? (this.agentDisplayName ?? "Agent (MSI-based)") : $"Caller-{e.CurrentDominantSpeaker}",
-                            Role = isFirstMsi ? "AGENT" : "CALLER",
-                            ChannelId = isFirstMsi ? (byte)1 : (byte)0,
-                            IsAgent = isFirstMsi,
-                            IsMsiFallback = true,
-                            MediaStreamIds = new List<uint> { e.CurrentDominantSpeaker },
-                            JoinTime = now,
-                        };
-
-                        this.participantsById[fakeParticipantId] = participantInfo;
-
-                        if (isFirstMsi)
-                        {
-                            this.lastKnownSpeakerId = fakeParticipantId;
-                            Console.WriteLine($"sMSI-FALLBACK: Registered MSI {e.CurrentDominantSpeaker} as AGENT (first speaker)");
-                        }
-                        else
-                        {
-                            Console.WriteLine($" MSI-FALLBACK: Registered MSI {e.CurrentDominantSpeaker} as CALLER");
-                        }
-                    }
-
-                    // Look up participant by MSI
-                    if (this.msiToParticipantId.TryGetValue(e.CurrentDominantSpeaker, out string participantId))
-                    {
-                        if (this.participantsById.TryGetValue(participantId, out var info))
-                        {
-                            this.lastKnownSpeakerId = participantId;
-                            this.lastKnownSpeakerTime = now;
-
-                            var channelName = info.IsAgent ? "CH1-AGENT" : "CH0-CALLER";
-                            if (this.detailedLogging)
-                            {
-                                Console.WriteLine($"Speaker: {info.DisplayName} [{channelName}] (MSI: {e.CurrentDominantSpeaker})");
-                            }
-                        }
-                    }
-                    else
-                    {
-                        if (this.detailedLogging)
-                        {
-                            Console.WriteLine($" MSI {e.CurrentDominantSpeaker} not mapped to any participant");
-                        }
-                    }
-                }
-                else
+                if (e.CurrentDominantSpeaker == DominantSpeakerChangedEventArgs.None)
                 {
                     this.currentDominantSpeakerMsi = null;
+                    return;
+                }
+
+                this.currentDominantSpeakerMsi = e.CurrentDominantSpeaker;
+                this.lastSpeakerChangeTime = now;
+
+                if (!this.msiToParticipantId.ContainsKey(e.CurrentDominantSpeaker))
+                {
+                    // Audio MSI arrives before the participant SDK reports the identity.
+                    // Create a placeholder so frames are attributed; the real participant's
+                    // arrival will evict this fallback.
+                    var placeholderId = $"MSI-{e.CurrentDominantSpeaker}";
+                    int channelId = Interlocked.Increment(ref this.nextChannelIndex) - 1;
+                    var placeholder = new ParticipantInfo
+                    {
+                        ParticipantId = placeholderId,
+                        DisplayName = $"Speaker-{e.CurrentDominantSpeaker}",
+                        ChannelId = channelId,
+                        IsMsiFallback = true,
+                        MediaStreamIds = new List<uint> { e.CurrentDominantSpeaker },
+                        JoinTime = now,
+                    };
+                    placeholder.FrameMetadataBytes = BuildFrameMetadata(this.currentSessionId, placeholder);
+                    this.msiToParticipantId[e.CurrentDominantSpeaker] = placeholderId;
+                    this.participantsById[placeholderId] = placeholder;
+                    Console.WriteLine($"MSI-FALLBACK: Registered placeholder for MSI {e.CurrentDominantSpeaker} on CH{channelId}");
+                }
+
+                if (this.msiToParticipantId.TryGetValue(e.CurrentDominantSpeaker, out var pid) &&
+                    this.participantsById.TryGetValue(pid, out var info))
+                {
+                    this.lastKnownSpeakerId = pid;
+                    this.lastKnownSpeakerTime = now;
+                    if (this.detailedLogging)
+                    {
+                        Console.WriteLine($"Speaker: {info.DisplayName} CH{info.ChannelId} MSI:{e.CurrentDominantSpeaker}");
+                    }
                 }
             }
             catch (Exception ex)
@@ -756,7 +653,6 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
                     return;
                 }
 
-                // Check for unmixed audio buffers with true per-speaker audio.
                 if (e.Buffer.UnmixedAudioBuffers != null)
                 {
                     try
@@ -769,18 +665,16 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
                     }
                     catch (ArgumentNullException)
                     {
-                        // UnmixedAudioBuffers collection is not properly initialized - fall through to mixed mode
+                        // Buffer not initialized — fall through to mixed mode
                     }
                 }
 
-                // Handle silence in unmixed mode by writing to all active tracks.
                 if (e.Buffer.IsSilence && this.unmixedAudioEnabled)
                 {
                     this.ProcessSilenceForUnmixedMode(e);
                     return;
                 }
 
-                // Fall back to mixed audio plus dominant speaker in compliance recording mode.
                 this.ProcessMixedAudio(e);
             }
             catch (Exception ex)
@@ -795,55 +689,26 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
 
         private void ProcessUnmixedAudio(AudioMediaReceivedEventArgs e)
         {
-            this.unmixedPacketCount++;
+            Interlocked.Increment(ref this.unmixedPacketCount);
 
             if (!this.unmixedAudioEnabled)
             {
                 this.unmixedAudioEnabled = true;
-                Console.WriteLine($" UNMIXED AUDIO MODE ENABLED!");
-                Console.WriteLine($" Received {e.Buffer.UnmixedAudioBuffers.Count()} unmixed audio streams");
+                Console.WriteLine($" UNMIXED AUDIO MODE ENABLED ({e.Buffer.UnmixedAudioBuffers.Count()} streams)");
             }
 
             foreach (var unmixedBuffer in e.Buffer.UnmixedAudioBuffers)
             {
                 uint msi = unmixedBuffer.ActiveSpeakerId;
-
-                // Copy audio data
                 byte[] audioData = new byte[unmixedBuffer.Length];
                 System.Runtime.InteropServices.Marshal.Copy(
-                    unmixedBuffer.Data,
-                    audioData,
-                    0,
-                    (int)unmixedBuffer.Length);
+                    unmixedBuffer.Data, audioData, 0, (int)unmixedBuffer.Length);
 
-                // Determine channel based on MSI
-                var channelResult = this.DetermineChannelByMsi(msi);
-
-                // Track statistics
-                if (channelResult.ChannelId == 1)
-                {
-                    this.agentPacketCount++;
-                }
-                else if (channelResult.ChannelId == 0)
-                {
-                    this.callerPacketCount++;
-                }
-                else
-                {
-                    this.unknownPacketCount++;
-                }
-
-                // Build and send frame
-                this.SendAudioFrame(audioData, channelResult.Participant, msi);
+                var participant = this.ResolveParticipantByMsi(msi);
+                this.SendAudioFrame(audioData, participant);
             }
 
-            // Log statistics
-            var now = DateTime.UtcNow;
-            if ((now - this.lastStatsLog).TotalSeconds >= 10)
-            {
-                this.LogStatistics();
-                this.lastStatsLog = now;
-            }
+            this.MaybeLogStatistics();
         }
 
         private void ProcessSilenceForUnmixedMode(AudioMediaReceivedEventArgs e)
@@ -853,36 +718,26 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
                 return;
             }
 
-            this.silencePacketCount++;
+            Interlocked.Increment(ref this.silencePacketCount);
 
-            // Copy silence buffer
             byte[] silenceData = new byte[e.Buffer.Length];
             System.Runtime.InteropServices.Marshal.Copy(
-                e.Buffer.Data,
-                silenceData,
-                0,
-                (int)e.Buffer.Length);
+                e.Buffer.Data, silenceData, 0, (int)e.Buffer.Length);
 
-            // Write silence to ALL active speaker tracks
-            foreach (var participantInfo in this.participantsById.Values)
+            foreach (var info in this.participantsById.Values)
             {
-                this.SendAudioFrame(silenceData, participantInfo, null);
+                this.SendAudioFrame(silenceData, info);
             }
         }
 
         private void ProcessMixedAudio(AudioMediaReceivedEventArgs e)
         {
-            this.mixedPacketCount++;
+            Interlocked.Increment(ref this.mixedPacketCount);
 
-            // Copy audio data
             byte[] audioData = new byte[e.Buffer.Length];
             System.Runtime.InteropServices.Marshal.Copy(
-                e.Buffer.Data,
-                audioData,
-                0,
-                (int)e.Buffer.Length);
+                e.Buffer.Data, audioData, 0, (int)e.Buffer.Length);
 
-            // Calculate audio energy
             double audioEnergy = this.CalculateAudioEnergy(audioData);
             this.recentAudioEnergy.Enqueue(audioEnergy);
             if (this.recentAudioEnergy.Count > ENERGYHISTORYSIZE)
@@ -893,188 +748,92 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
             double avgEnergy = this.recentAudioEnergy.Count > 0 ? this.recentAudioEnergy.Average() : 0;
             bool isTrueSilence = avgEnergy < SILENCEENERGYTHRESHOLD;
 
-            // Determine channel using dominant speaker logic
-            var channelResult = this.DetermineChannel(isTrueSilence);
-
-            // Track statistics
             if (isTrueSilence)
             {
-                this.silencePacketCount++;
-            }
-            else
-            {
-                if (channelResult.ChannelId == 1)
-                {
-                    this.agentPacketCount++;
-                }
-                else if (channelResult.ChannelId == 0)
-                {
-                    this.callerPacketCount++;
-                }
-                else
-                {
-                    this.unknownPacketCount++;
-                }
+                Interlocked.Increment(ref this.silencePacketCount);
             }
 
-            // Send frame
-            this.SendAudioFrame(audioData, channelResult.Participant, this.currentDominantSpeakerMsi);
+            var participant = this.ResolveSpeaker();
+            this.SendAudioFrame(audioData, participant);
 
-            // Log statistics
-            var now = DateTime.UtcNow;
-            if (!isTrueSilence && (now - this.lastStatsLog).TotalSeconds >= 10)
-            {
-                this.LogStatistics();
-                this.lastStatsLog = now;
-            }
+            this.MaybeLogStatistics();
         }
 
-        private ChannelDetermination DetermineChannelByMsi(uint msi)
+        private ParticipantInfo ResolveParticipantByMsi(uint msi)
         {
-            // Look up participant by MSI
-            if (this.msiToParticipantId.TryGetValue(msi, out string participantId))
+            if (this.msiToParticipantId.TryGetValue(msi, out var pid) &&
+                this.participantsById.TryGetValue(pid, out var info))
             {
-                if (this.participantsById.TryGetValue(participantId, out var participant))
-                {
-                    return new ChannelDetermination
-                    {
-                        ChannelId = participant.ChannelId,
-                        SpeakerInfo = $"{participant.DisplayName} ({participant.Role})",
-                        Confidence = "HIGH - Unmixed MSI",
-                        Participant = participant,
-                    };
-                }
+                return info;
             }
 
-            // Unknown MSI - default to caller
-            return new ChannelDetermination
-            {
-                ChannelId = 0,
-                SpeakerInfo = $"Unknown-MSI-{msi}",
-                Confidence = "LOW - Unknown unmixed MSI",
-            };
+            return null;
         }
 
-        private ChannelDetermination DetermineChannel(bool isTrueSilence)
+        private ParticipantInfo ResolveSpeaker()
         {
-            var now = DateTime.UtcNow;
-
-            // Strategy 1: Use current dominant speaker
             if (this.currentDominantSpeakerMsi.HasValue)
             {
-                if (this.msiToParticipantId.TryGetValue(this.currentDominantSpeakerMsi.Value, out string participantId))
+                var info = this.ResolveParticipantByMsi(this.currentDominantSpeakerMsi.Value);
+                if (info != null)
                 {
-                    if (this.participantsById.TryGetValue(participantId, out var participant))
-                    {
-                        return new ChannelDetermination
-                        {
-                            ChannelId = participant.ChannelId,
-                            SpeakerInfo = $"{participant.DisplayName} ({participant.Role})",
-                            Confidence = "HIGH - Current dominant speaker",
-                            Participant = participant,
-                        };
-                    }
+                    return info;
                 }
             }
 
-            // Strategy 2: Use speaker persistence
             if (!string.IsNullOrEmpty(this.lastKnownSpeakerId))
             {
-                var timeSinceLastSpeaker = (now - this.lastKnownSpeakerTime).TotalMilliseconds;
-
-                if (timeSinceLastSpeaker < SPEAKERPERSISTENCEMS)
+                var elapsed = (DateTime.UtcNow - this.lastKnownSpeakerTime).TotalMilliseconds;
+                if (elapsed < SPEAKERPERSISTENCEMS &&
+                    this.participantsById.TryGetValue(this.lastKnownSpeakerId, out var info))
                 {
-                    if (this.participantsById.TryGetValue(this.lastKnownSpeakerId, out var participant))
-                    {
-                        return new ChannelDetermination
-                        {
-                            ChannelId = participant.ChannelId,
-                            SpeakerInfo = $"{participant.DisplayName} ({participant.Role})",
-                            Confidence = $"MEDIUM - Persistence ({timeSinceLastSpeaker:F0}ms ago)",
-                            Participant = participant,
-                        };
-                    }
+                    return info;
                 }
             }
 
-            // Strategy 3: Only one participant
             if (this.participantsById.Count == 1)
             {
-                var onlyParticipant = this.participantsById.Values.First();
-                return new ChannelDetermination
+                foreach (var info in this.participantsById.Values)
                 {
-                    ChannelId = onlyParticipant.ChannelId,
-                    SpeakerInfo = $"{onlyParticipant.DisplayName} (only participant)",
-                    Confidence = "MEDIUM - Only participant",
-                    Participant = onlyParticipant,
-                };
+                    return info;
+                }
             }
 
-            // Strategy 4: Default to caller
-            return new ChannelDetermination
-            {
-                ChannelId = 0,
-                SpeakerInfo = "Unknown",
-                Confidence = "VERY LOW - No speaker info",
-            };
+            return null;
         }
 
-        private void SendAudioFrame(byte[] audioData, ParticipantInfo participant, uint? msi)
+        private void SendAudioFrame(byte[] audioData, ParticipantInfo participant)
         {
             if (this.connectedClients.IsEmpty)
             {
                 return;
             }
 
-            var metadataBytes = Encoding.UTF8.GetBytes(this.BuildFrameMetadataJson(participant, msi));
+            byte[] metadataBytes = participant?.FrameMetadataBytes ?? this.fallbackFrameMetadataBytes;
 
-            // IAB1 frame: magic(4) + metadataLen(4) + audioLen(4) + metadata + audio
-            var frame = new byte[12 + metadataBytes.Length + audioData.Length];
-            int offset = 0;
-            Buffer.BlockCopy(Iab1Magic, 0, frame, offset, 4);
-            offset += 4;
-            Buffer.BlockCopy(BitConverter.GetBytes((uint)metadataBytes.Length), 0, frame, offset, 4);
-            offset += 4;
-            Buffer.BlockCopy(BitConverter.GetBytes((uint)audioData.Length), 0, frame, offset, 4);
-            offset += 4;
-            Buffer.BlockCopy(metadataBytes, 0, frame, offset, metadataBytes.Length);
-            offset += metadataBytes.Length;
-            Buffer.BlockCopy(audioData, 0, frame, offset, audioData.Length);
+            var frame = new byte[IAB1HEADERLEN + metadataBytes.Length + audioData.Length];
+            Buffer.BlockCopy(Iab1Magic, 0, frame, 0, 4);
+            Buffer.BlockCopy(BitConverter.GetBytes((uint)metadataBytes.Length), 0, frame, 4, 4);
+            Buffer.BlockCopy(BitConverter.GetBytes((uint)audioData.Length), 0, frame, 8, 4);
+            Buffer.BlockCopy(metadataBytes, 0, frame, IAB1HEADERLEN, metadataBytes.Length);
+            Buffer.BlockCopy(audioData, 0, frame, IAB1HEADERLEN + metadataBytes.Length, audioData.Length);
 
-            this.SendToClients(frame);
-
-            if (this.detailedLogging)
-            {
-                double energy = this.CalculateAudioEnergy(audioData);
-                if (energy > SILENCEENERGYTHRESHOLD)
-                {
-                    var channelName = participant?.ChannelId == 1 ? "CH1-AGENT" :
-                                     participant?.ChannelId == 0 ? "CH0-CALLER" : "CH?-UNKNOWN";
-                    Console.WriteLine($" SENDING [{channelName}] {audioData.Length}B | {participant?.DisplayName ?? "Unknown"}" +
-                        (msi.HasValue ? $" MSI:{msi.Value}" : string.Empty) + $" | Energy:{energy:F0}");
-                }
-            }
+            this.QueueAudioFrame(frame);
         }
 
-        private string BuildFrameMetadataJson(ParticipantInfo participant, uint? msi)
+        private void QueueAudioFrame(byte[] frame)
         {
-            var streamId = participant?.ParticipantId
-                ?? (msi.HasValue ? $"msi-{msi.Value}" : "unknown-stream");
-
-            var sb = new StringBuilder();
-            sb.Append("{");
-            sb.AppendFormat("\"callId\":\"{0}\",", this.currentSessionId);
-            sb.AppendFormat("\"streamId\":\"{0}\",", streamId);
-            sb.AppendFormat("\"userId\":\"{0}\",", participant?.UserId ?? string.Empty);
-            sb.AppendFormat("\"displayName\":\"{0}\",", EscapeJsonString(participant?.DisplayName ?? string.Empty));
-            sb.AppendFormat("\"identityType\":\"{0}\",", participant?.IsAgent == true ? "agent" : "caller");
-            sb.AppendFormat("\"channelId\":{0},", participant?.ChannelId ?? 0);
-            sb.AppendFormat("\"participantTenantId\":\"{0}\",", participant?.TenantId ?? string.Empty);
-            sb.AppendFormat("\"configuredOrgId\":\"{0}\",", participant?.ConfiguredOrgId ?? this.configuredOrgId ?? string.Empty);
-            sb.AppendFormat("\"callerType\":\"{0}\",", participant?.CallerType ?? "EXTERNAL_TEAMS");
-            sb.AppendFormat("\"isInternal\":{0}", participant?.IsInternal == true ? "true" : "false");
-            sb.Append("}");
-            return sb.ToString();
+            try
+            {
+                if (this.audioFrameQueue.IsAddingCompleted || !this.audioFrameQueue.TryAdd(frame))
+                {
+                    Interlocked.Increment(ref this.droppedAudioFrameCount);
+                }
+            }
+            catch (InvalidOperationException)
+            {
+                Interlocked.Increment(ref this.droppedAudioFrameCount);
+            }
         }
 
         private double CalculateAudioEnergy(byte[] audioData)
@@ -1089,18 +848,69 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
             return Math.Sqrt(sum / (audioData.Length / 2));
         }
 
-        private void SendToClients(byte[] frame)
+        private void MaybeLogStatistics()
+        {
+            var now = DateTime.UtcNow;
+            if ((now - this.lastStatsLog).TotalSeconds < 10)
+            {
+                return;
+            }
+
+            this.lastStatsLog = now;
+            Console.WriteLine(
+                $"STATS: mixed={Interlocked.Read(ref this.mixedPacketCount)} " +
+                $"unmixed={Interlocked.Read(ref this.unmixedPacketCount)} " +
+                $"silence={Interlocked.Read(ref this.silencePacketCount)} " +
+                $"droppedAudio={Interlocked.Read(ref this.droppedAudioFrameCount)} " +
+                $"droppedMeta={Interlocked.Read(ref this.droppedMetadataMessageCount)} " +
+                $"participants={this.participantsById.Count}");
+        }
+
+        private void ValidateSubscriptionMediaType(MediaType mediaType)
+        {
+            if (mediaType != MediaType.Vbss && mediaType != MediaType.Video)
+            {
+                throw new ArgumentOutOfRangeException($"Invalid mediaType: {mediaType}");
+            }
+        }
+
+        private void StartAudioStreamServer()
         {
             try
             {
-                if (this.audioFrameQueue.IsAddingCompleted || !this.audioFrameQueue.TryAdd(frame))
-                {
-                    this.droppedAudioFrameCount++;
-                }
+                this.audioStreamServer = new TcpListener(IPAddress.Any, AUDIOSTREAMPORT);
+                this.audioStreamServer.Start();
+                Console.WriteLine($"LISTENING: 0.0.0.0:{AUDIOSTREAMPORT} (Audio Stream — IAB1 frames)");
+
+                Task.Run(() => this.ProcessAudioFrameQueue(), this.shutdownCts.Token);
+                _ = Task.Run(async () => await this.AcceptAudioClientsAsync().ConfigureAwait(false));
             }
-            catch (InvalidOperationException)
+            catch (Exception ex)
             {
-                this.droppedAudioFrameCount++;
+                Console.WriteLine($"Failed to start audio server: {ex.Message}");
+            }
+        }
+
+        private async Task AcceptAudioClientsAsync()
+        {
+            while (this.audioStreamServer != null && !this.shutdownCts.IsCancellationRequested)
+            {
+                try
+                {
+                    var client = await this.audioStreamServer.AcceptTcpClientAsync().ConfigureAwait(false);
+                    client.NoDelay = true;
+                    Console.WriteLine($"Audio client connected: {((IPEndPoint)client.Client.RemoteEndPoint).Address}");
+                    this.connectedClients[client] = 0;
+                }
+                catch (Exception ex)
+                {
+                    if (!this.shutdownCts.IsCancellationRequested)
+                    {
+                        Console.WriteLine($"Audio accept error: {ex.Message}");
+                    }
+
+                    break;
+                }
             }
         }
 
@@ -1108,10 +918,13 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
         {
             try
             {
-                foreach (var frame in this.audioFrameQueue.GetConsumingEnumerable())
+                foreach (var frame in this.audioFrameQueue.GetConsumingEnumerable(this.shutdownCts.Token))
                 {
                     this.WriteAudioFrameToClients(frame);
                 }
+            }
+            catch (OperationCanceledException)
+            {
             }
             catch (ObjectDisposedException)
             {
@@ -1143,7 +956,7 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
 
         private void RemoveAudioClient(TcpClient client)
         {
-            if (this.connectedClients.TryRemove(client, out byte _))
+            if (this.connectedClients.TryRemove(client, out _))
             {
                 try
                 {
@@ -1155,86 +968,17 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
             }
         }
 
-        private void LogStatistics()
-        {
-            var total = this.agentPacketCount + this.callerPacketCount + this.unknownPacketCount;
-
-            if (total == 0)
-            {
-                Console.WriteLine($"STATS: No audio packets yet (Silence: {this.silencePacketCount})");
-                return;
-            }
-
-            var agentPercent = this.agentPacketCount * 100.0 / total;
-            var callerPercent = this.callerPacketCount * 100.0 / total;
-
-            if (this.unmixedAudioEnabled)
-            {
-                Console.WriteLine($"Unmixed packets: {this.unmixedPacketCount}, dropped audio frames: {this.droppedAudioFrameCount}, dropped metadata messages: {this.droppedMetadataMessageCount}");
-            }
-            else
-            {
-                Console.WriteLine($"Mixed packets: {this.mixedPacketCount}, dropped audio frames: {this.droppedAudioFrameCount}, dropped metadata messages: {this.droppedMetadataMessageCount}");
-            }
-        }
-
-        private void ValidateSubscriptionMediaType(MediaType mediaType)
-        {
-            if (mediaType != MediaType.Vbss && mediaType != MediaType.Video)
-            {
-                throw new ArgumentOutOfRangeException($"Invalid mediaType: {mediaType}");
-            }
-        }
-
-        private async Task AcceptClientsAsync()
-        {
-            while (this.audioStreamServer != null)
-            {
-                try
-                {
-                    var client = await this.audioStreamServer.AcceptTcpClientAsync().ConfigureAwait(false);
-                    client.NoDelay = true;
-                    Console.WriteLine($"STT client connected: {((IPEndPoint)client.Client.RemoteEndPoint).Address}");
-                    this.connectedClients[client] = 0;
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($"Accept error: {ex.Message}");
-                    break;
-                }
-            }
-        }
-
-        private void StartAudioStreamServer()
-        {
-            Console.WriteLine("StartAudioStreamServer() CALLED!");
-
-            try
-            {
-                this.audioStreamServer = new TcpListener(IPAddress.Any, 5001);
-                this.audioStreamServer.Start();
-                Console.WriteLine("Audio stream server listening on port 5001");
-
-                Task.Run(() => this.ProcessAudioFrameQueue());
-                Task.Run(async () => await this.AcceptClientsAsync().ConfigureAwait(false));
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Failed to start audio server: {ex.Message}");
-            }
-        }
-
         private void StopAudioStreamServer()
         {
             try
             {
                 var closeMeta = Encoding.UTF8.GetBytes(
                     $"{{\"callId\":\"{this.currentSessionId}\",\"streamId\":\"eos\",\"endOfStream\":true}}");
-                var closeFrame = new byte[12 + closeMeta.Length];
+                var closeFrame = new byte[IAB1HEADERLEN + closeMeta.Length];
                 Buffer.BlockCopy(Iab1Magic, 0, closeFrame, 0, 4);
                 Buffer.BlockCopy(BitConverter.GetBytes((uint)closeMeta.Length), 0, closeFrame, 4, 4);
                 Buffer.BlockCopy(BitConverter.GetBytes(0u), 0, closeFrame, 8, 4);
-                Buffer.BlockCopy(closeMeta, 0, closeFrame, 12, closeMeta.Length);
+                Buffer.BlockCopy(closeMeta, 0, closeFrame, IAB1HEADERLEN, closeMeta.Length);
 
                 foreach (var client in this.connectedClients.Keys)
                 {
@@ -1263,15 +1007,13 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
 
         private void StartMetadataStreamServer()
         {
-            Console.WriteLine("StartMetadataStreamServer() CALLED!");
-
             try
             {
-                this.metadataStreamServer = new TcpListener(IPAddress.Any, 5002);
+                this.metadataStreamServer = new TcpListener(IPAddress.Any, METADATASTREAMPORT);
                 this.metadataStreamServer.Start();
-                Console.WriteLine("LISTENING: 0.0.0.0:5002 (Metadata Stream)");
+                Console.WriteLine($"LISTENING: 0.0.0.0:{METADATASTREAMPORT} (Participant Metadata Stream)");
 
-                Task.Run(() => this.ProcessMetadataMessageQueue());
+                Task.Run(() => this.ProcessMetadataMessageQueue(), this.shutdownCts.Token);
                 _ = Task.Run(async () => await this.AcceptMetadataClientsAsync().ConfigureAwait(false));
             }
             catch (Exception ex)
@@ -1282,19 +1024,23 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
 
         private async Task AcceptMetadataClientsAsync()
         {
-            while (this.metadataStreamServer != null)
+            while (this.metadataStreamServer != null && !this.shutdownCts.IsCancellationRequested)
             {
                 try
                 {
                     var client = await this.metadataStreamServer.AcceptTcpClientAsync().ConfigureAwait(false);
                     client.NoDelay = true;
-                    Console.WriteLine($" Metadata client connected: {((IPEndPoint)client.Client.RemoteEndPoint).Address}");
+                    Console.WriteLine($"Metadata client connected: {((IPEndPoint)client.Client.RemoteEndPoint).Address}");
                     this.connectedMetadataClients[client] = 0;
                     this.SendCurrentParticipantsSnapshot(client);
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine($"Metadata accept error: {ex.Message}");
+                    if (!this.shutdownCts.IsCancellationRequested)
+                    {
+                        Console.WriteLine($"Metadata accept error: {ex.Message}");
+                    }
+
                     break;
                 }
             }
@@ -1304,17 +1050,16 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
         {
             try
             {
-                foreach (var kvp in this.participantsById)
+                foreach (var info in this.participantsById.Values)
                 {
-                    if (kvp.Value.IsMsiFallback)
+                    if (info.IsMsiFallback)
                     {
                         continue;
                     }
 
-                    var json = this.BuildParticipantJson(kvp.Value, "CURRENT");
-                    var jsonBytes = Encoding.UTF8.GetBytes(json + "\n");
-                    client.GetStream().Write(jsonBytes, 0, jsonBytes.Length);
-                    Console.WriteLine($"FLOW[Bot->SPL Snapshot] session={this.currentSessionId} event=CURRENT userId={kvp.Value?.UserId ?? string.Empty} name={kvp.Value?.DisplayName ?? string.Empty} role={kvp.Value?.Role ?? string.Empty} callerType={kvp.Value?.CallerType ?? string.Empty}");
+                    var json = BuildParticipantEventJson(this.currentSessionId, info, "CURRENT");
+                    var bytes = Encoding.UTF8.GetBytes(json + "\n");
+                    client.GetStream().Write(bytes, 0, bytes.Length);
                 }
             }
             catch (Exception ex)
@@ -1323,7 +1068,7 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
             }
         }
 
-        private void SendParticipantMetadata(ParticipantInfo info, string eventType)
+        private void SendParticipantEvent(ParticipantInfo info, string eventType)
         {
             try
             {
@@ -1332,58 +1077,39 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
                     return;
                 }
 
-                var json = this.BuildParticipantJson(info, eventType);
-                var jsonBytes = Encoding.UTF8.GetBytes(json + "\n");
-
-                Console.WriteLine($"FLOW[Bot->SPL] session={this.currentSessionId} event={eventType} userId={info.UserId ?? string.Empty} participantId={info.ParticipantId ?? string.Empty} name={info.DisplayName ?? string.Empty} role={info.Role ?? string.Empty} callerType={info.CallerType ?? string.Empty} isInternal={info.IsInternal} isAgent={info.IsAgent} channel={info.ChannelId}");
+                var json = BuildParticipantEventJson(this.currentSessionId, info, eventType);
+                var bytes = Encoding.UTF8.GetBytes(json + "\n");
+                Console.WriteLine($"FLOW[Bot->Consumer] session={this.currentSessionId} event={eventType} participantId={info.ParticipantId} userId={info.UserId ?? string.Empty} name={info.DisplayName ?? string.Empty} channel={info.ChannelId}");
 
                 try
                 {
-                    if (this.metadataMessageQueue.IsAddingCompleted || !this.metadataMessageQueue.TryAdd(jsonBytes))
+                    if (this.metadataMessageQueue.IsAddingCompleted || !this.metadataMessageQueue.TryAdd(bytes))
                     {
-                        this.droppedMetadataMessageCount++;
+                        Interlocked.Increment(ref this.droppedMetadataMessageCount);
                     }
                 }
                 catch (InvalidOperationException)
                 {
-                    this.droppedMetadataMessageCount++;
+                    Interlocked.Increment(ref this.droppedMetadataMessageCount);
                 }
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Error sending participant metadata: {ex.Message}");
+                Console.WriteLine($"Error sending participant event: {ex.Message}");
             }
-        }
-
-        private string BuildParticipantJson(ParticipantInfo info, string eventType)
-        {
-            var sb = new StringBuilder();
-            sb.Append("{");
-            sb.AppendFormat("\"eventType\":\"{0}\",", eventType);
-            sb.AppendFormat("\"sessionId\":\"{0}\",", this.currentSessionId);
-            sb.AppendFormat("\"timestamp\":\"{0}\",", DateTime.UtcNow.ToString("o"));
-            sb.AppendFormat("\"participantId\":\"{0}\",", info.ParticipantId ?? string.Empty);
-            sb.AppendFormat("\"userId\":\"{0}\",", info.UserId ?? string.Empty);
-            sb.AppendFormat("\"displayName\":\"{0}\",", info.DisplayName ?? string.Empty);
-            sb.AppendFormat("\"role\":\"{0}\",", info.Role ?? string.Empty);
-            sb.AppendFormat("\"tenantId\":\"{0}\",", info.TenantId ?? "unknown");
-            sb.AppendFormat("\"configuredOrgId\":\"{0}\",", info.ConfiguredOrgId ?? string.Empty);
-            sb.AppendFormat("\"callerType\":\"{0}\",", info.CallerType ?? "EXTERNAL_TEAMS");
-            sb.AppendFormat("\"isInternal\":{0},", info.IsInternal ? "true" : "false");
-            sb.AppendFormat("\"isAgent\":{0},", info.IsAgent ? "true" : "false");
-            sb.AppendFormat("\"channelId\":{0}", info.ChannelId);
-            sb.Append("}");
-            return sb.ToString();
         }
 
         private void ProcessMetadataMessageQueue()
         {
             try
             {
-                foreach (var message in this.metadataMessageQueue.GetConsumingEnumerable())
+                foreach (var message in this.metadataMessageQueue.GetConsumingEnumerable(this.shutdownCts.Token))
                 {
                     this.WriteMetadataMessageToClients(message);
                 }
+            }
+            catch (OperationCanceledException)
+            {
             }
             catch (ObjectDisposedException)
             {
@@ -1415,7 +1141,7 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
 
         private void RemoveMetadataClient(TcpClient client)
         {
-            if (this.connectedMetadataClients.TryRemove(client, out byte _))
+            if (this.connectedMetadataClients.TryRemove(client, out _))
             {
                 try
                 {
@@ -1456,123 +1182,6 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
             }
         }
 
-        private void StartCommandServer()
-        {
-            Console.WriteLine("StartCommandServer() CALLED!");
-
-            try
-            {
-                this.commandServer = new TcpListener(IPAddress.Any, 5003);
-                this.commandServer.Start();
-                Console.WriteLine("LISTENING: 0.0.0.0:5003 (Command Server - SET_AGENT)");
-                _ = Task.Run(async () => await this.AcceptCommandClientsAsync().ConfigureAwait(false));
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Failed to start command server: {ex.Message}");
-            }
-        }
-
-        private async Task AcceptCommandClientsAsync()
-        {
-            while (this.commandServer != null)
-            {
-                try
-                {
-                    var client = await this.commandServer.AcceptTcpClientAsync().ConfigureAwait(false);
-                    Console.WriteLine($"Command client connected: {((IPEndPoint)client.Client.RemoteEndPoint).Address}");
-                    _ = Task.Run(async () => await this.HandleCommandClientAsync(client).ConfigureAwait(false));
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($"Command accept error: {ex.Message}");
-                    break;
-                }
-            }
-        }
-
-        private async Task HandleCommandClientAsync(TcpClient client)
-        {
-            try
-            {
-                using (var reader = new System.IO.StreamReader(client.GetStream(), Encoding.UTF8))
-                {
-                    string line;
-                    while ((line = await reader.ReadLineAsync().ConfigureAwait(false)) != null)
-                    {
-                        line = line.Trim();
-                        if (string.IsNullOrEmpty(line))
-                        {
-                            continue;
-                        }
-
-                        if (line.Contains("\"SET_AGENT\""))
-                        {
-                            string newUserId = this.ExtractJsonStringValue(line, "userId");
-                            string newDisplayName = this.ExtractJsonStringValue(line, "displayName");
-                            if (!string.IsNullOrWhiteSpace(newUserId))
-                            {
-                                this.agentUserId = newUserId.Trim();
-                            }
-
-                            if (!string.IsNullOrWhiteSpace(newDisplayName))
-                            {
-                                this.agentDisplayName = newDisplayName.Trim();
-                            }
-
-                            Console.WriteLine($" FLOW[SPL->Bot Command] command=SET_AGENT userId={this.agentUserId ?? string.Empty} displayName={this.agentDisplayName ?? string.Empty}");
-                        }
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Command client error: {ex.Message}");
-            }
-            finally
-            {
-                try
-                {
-                    client.Close();
-                }
-                catch
-                {
-                }
-            }
-        }
-
-        private string ExtractJsonStringValue(string json, string key)
-        {
-            var search = $"\"{key}\":\"";
-            int start = json.IndexOf(search, StringComparison.Ordinal);
-            if (start < 0)
-            {
-                return null;
-            }
-
-            start += search.Length;
-            int end = json.IndexOf('"', start);
-            if (end < 0)
-            {
-                return null;
-            }
-
-            return json.Substring(start, end - start);
-        }
-
-        private void StopCommandServer()
-        {
-            try
-            {
-                this.commandServer?.Stop();
-                this.commandServer = null;
-                Console.WriteLine("Command server stopped");
-            }
-            catch
-            {
-            }
-        }
-
         private void OnVideoMediaReceived(object sender, VideoMediaReceivedEventArgs e)
         {
             this.GraphLogger.Info($"[{e.SocketId}]: Received Video");
@@ -1585,6 +1194,13 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
             e.Buffer.Dispose();
         }
 
+        /// <summary>
+        /// Immutable-ish participant record. Identity fields are set at construction.
+        /// MediaStreamIds and FrameMetadataBytes may be appended/replaced during participant
+        /// lifetime but only from the SDK callback thread sequence (ProcessParticipant /
+        /// OnDominantSpeakerChanged), so no extra synchronization is needed beyond the
+        /// outer ConcurrentDictionary.
+        /// </summary>
         private class ParticipantInfo
         {
             internal string ParticipantId { get; set; }
@@ -1593,36 +1209,17 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
 
             internal string DisplayName { get; set; }
 
-            internal string Role { get; set; }
-
-            internal byte ChannelId { get; set; }
-
-            internal bool IsAgent { get; set; }
-
-            internal bool IsMsiFallback { get; set; }
-
-            internal string CallerType { get; set; }
-
-            internal bool IsInternal { get; set; }
-
             internal string TenantId { get; set; }
 
-            internal string ConfiguredOrgId { get; set; }
+            internal int ChannelId { get; set; }
+
+            internal bool IsMsiFallback { get; set; }
 
             internal List<uint> MediaStreamIds { get; set; }
 
             internal DateTime JoinTime { get; set; }
-        }
 
-        private class ChannelDetermination
-        {
-            internal byte ChannelId { get; set; }
-
-            internal string SpeakerInfo { get; set; }
-
-            internal string Confidence { get; set; }
-
-            internal ParticipantInfo Participant { get; set; }
+            internal byte[] FrameMetadataBytes { get; set; }
         }
     }
 }

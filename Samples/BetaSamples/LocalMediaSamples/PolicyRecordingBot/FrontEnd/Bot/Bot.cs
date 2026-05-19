@@ -234,7 +234,7 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
         {
             foreach (var call in args.AddedResources)
             {
-                var callHandler = new CallHandler(call, this.configuration?.HomeTenantId);
+                var callHandler = new CallHandler(call);
                 this.CallHandlers[call.Id] = callHandler;
             }
 
