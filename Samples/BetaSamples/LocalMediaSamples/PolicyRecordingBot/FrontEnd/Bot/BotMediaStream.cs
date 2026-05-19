@@ -513,6 +513,7 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
                             uint.TryParse(stream.SourceId, out uint msi))
                         {
                             mediaStreamIds.Add(msi);
+                            Console.WriteLine($"  Identity '{displayName}' audio MSI={msi} direction={stream.Direction}");
                         }
                     }
                 }
@@ -694,11 +695,12 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
                 if (this.msiToParticipantId.TryGetValue(e.CurrentDominantSpeaker, out var pid) &&
                     this.participantsById.TryGetValue(pid, out var info))
                 {
+                    var speakerChanged = this.lastKnownSpeakerId != pid;
                     this.lastKnownSpeakerId = pid;
                     this.lastKnownSpeakerTime = now;
-                    if (this.detailedLogging)
+                    if (speakerChanged)
                     {
-                        Console.WriteLine($"Speaker: {info.DisplayName} CH{info.ChannelId} MSI:{e.CurrentDominantSpeaker}");
+                        Console.WriteLine($"Speaker resolved: MSI {e.CurrentDominantSpeaker} -> {info.DisplayName} (userId={info.UserId ?? "<empty>"}, CH{info.ChannelId}, fallback={info.IsMsiFallback})");
                     }
                 }
             }
