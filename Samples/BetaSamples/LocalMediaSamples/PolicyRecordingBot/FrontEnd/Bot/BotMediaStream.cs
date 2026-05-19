@@ -41,6 +41,8 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
         private const int MAXQUEUEDAUDIOFRAMES = 200;
         private const int MAXQUEUEDMETADATAMESSAGES = 100;
 
+        private static readonly byte[] Iab1Magic = { 0x49, 0x41, 0x42, 0x31 }; // "IAB1"
+
         private readonly IAudioSocket audioSocket;
         private readonly IVideoSocket vbssSocket;
         private readonly List<IVideoSocket> videoSockets;
@@ -811,15 +813,13 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
 
                 // Determine channel based on MSI
                 var channelResult = this.DetermineChannelByMsi(msi);
-                byte channelByte = channelResult.ChannelId;
-                string speakerInfo = channelResult.SpeakerInfo;
 
                 // Track statistics
-                if (channelByte == 1)
+                if (channelResult.ChannelId == 1)
                 {
                     this.agentPacketCount++;
                 }
-                else if (channelByte == 0)
+                else if (channelResult.ChannelId == 0)
                 {
                     this.callerPacketCount++;
                 }
@@ -829,7 +829,7 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
                 }
 
                 // Build and send frame
-                this.SendAudioFrame(audioData, channelByte, speakerInfo, msi);
+                this.SendAudioFrame(audioData, channelResult.Participant, msi);
             }
 
             // Log statistics
@@ -861,7 +861,7 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
             // Write silence to ALL active speaker tracks
             foreach (var participantInfo in this.participantsById.Values)
             {
-                this.SendAudioFrame(silenceData, participantInfo.ChannelId, $"{participantInfo.DisplayName} (silence)", null);
+                this.SendAudioFrame(silenceData, participantInfo, null);
             }
         }
 
@@ -890,8 +890,6 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
 
             // Determine channel using dominant speaker logic
             var channelResult = this.DetermineChannel(isTrueSilence);
-            byte channelByte = channelResult.ChannelId;
-            string speakerInfo = channelResult.SpeakerInfo;
 
             // Track statistics
             if (isTrueSilence)
@@ -900,11 +898,11 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
             }
             else
             {
-                if (channelByte == 1)
+                if (channelResult.ChannelId == 1)
                 {
                     this.agentPacketCount++;
                 }
-                else if (channelByte == 0)
+                else if (channelResult.ChannelId == 0)
                 {
                     this.callerPacketCount++;
                 }
@@ -915,7 +913,7 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
             }
 
             // Send frame
-            this.SendAudioFrame(audioData, channelByte, speakerInfo, this.currentDominantSpeakerMsi);
+            this.SendAudioFrame(audioData, channelResult.Participant, this.currentDominantSpeakerMsi);
 
             // Log statistics
             var now = DateTime.UtcNow;
@@ -938,6 +936,7 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
                         ChannelId = participant.ChannelId,
                         SpeakerInfo = $"{participant.DisplayName} ({participant.Role})",
                         Confidence = "HIGH - Unmixed MSI",
+                        Participant = participant,
                     };
                 }
             }
@@ -967,6 +966,7 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
                             ChannelId = participant.ChannelId,
                             SpeakerInfo = $"{participant.DisplayName} ({participant.Role})",
                             Confidence = "HIGH - Current dominant speaker",
+                            Participant = participant,
                         };
                     }
                 }
@@ -986,6 +986,7 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
                             ChannelId = participant.ChannelId,
                             SpeakerInfo = $"{participant.DisplayName} ({participant.Role})",
                             Confidence = $"MEDIUM - Persistence ({timeSinceLastSpeaker:F0}ms ago)",
+                            Participant = participant,
                         };
                     }
                 }
@@ -1000,6 +1001,7 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
                     ChannelId = onlyParticipant.ChannelId,
                     SpeakerInfo = $"{onlyParticipant.DisplayName} (only participant)",
                     Confidence = "MEDIUM - Only participant",
+                    Participant = onlyParticipant,
                 };
             }
 
@@ -1012,21 +1014,23 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
             };
         }
 
-        private void SendAudioFrame(byte[] audioData, byte channelByte, string speakerInfo, uint? msi)
+        private void SendAudioFrame(byte[] audioData, ParticipantInfo participant, uint? msi)
         {
             if (this.connectedClients.IsEmpty)
             {
                 return;
             }
 
-            var frame = new byte[41 + audioData.Length];
-            byte[] sessionId = Encoding.ASCII.GetBytes(this.currentSessionId.PadRight(36).Substring(0, 36));
-            Buffer.BlockCopy(sessionId, 0, frame, 0, 36);
-            frame[36] = channelByte;
+            var metadataBytes = Encoding.UTF8.GetBytes(this.BuildFrameMetadataJson(participant, msi));
 
-            byte[] lengthBytes = BitConverter.GetBytes((uint)audioData.Length);
-            Buffer.BlockCopy(lengthBytes, 0, frame, 37, 4);
-            Buffer.BlockCopy(audioData, 0, frame, 41, audioData.Length);
+            // IAB1 frame: magic(4) + metadataLen(4) + audioLen(4) + metadata + audio
+            var frame = new byte[12 + metadataBytes.Length + audioData.Length];
+            int offset = 0;
+            Buffer.BlockCopy(Iab1Magic, 0, frame, offset, 4); offset += 4;
+            Buffer.BlockCopy(BitConverter.GetBytes((uint)metadataBytes.Length), 0, frame, offset, 4); offset += 4;
+            Buffer.BlockCopy(BitConverter.GetBytes((uint)audioData.Length), 0, frame, offset, 4); offset += 4;
+            Buffer.BlockCopy(metadataBytes, 0, frame, offset, metadataBytes.Length); offset += metadataBytes.Length;
+            Buffer.BlockCopy(audioData, 0, frame, offset, audioData.Length);
 
             this.SendToClients(frame);
 
@@ -1035,12 +1039,38 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
                 double energy = this.CalculateAudioEnergy(audioData);
                 if (energy > SILENCEENERGYTHRESHOLD)
                 {
-                    var channelName = channelByte == 1 ? "CH1-AGENT" :
-                                     channelByte == 0 ? "CH0-CALLER" : "CH?-UNKNOWN";
-                    Console.WriteLine($" SENDING [{channelName}] {audioData.Length}B | {speakerInfo}" +
+                    var channelName = participant?.ChannelId == 1 ? "CH1-AGENT" :
+                                     participant?.ChannelId == 0 ? "CH0-CALLER" : "CH?-UNKNOWN";
+                    Console.WriteLine($" SENDING [{channelName}] {audioData.Length}B | {participant?.DisplayName ?? "Unknown"}" +
                         (msi.HasValue ? $" MSI:{msi.Value}" : string.Empty) + $" | Energy:{energy:F0}");
                 }
             }
+        }
+
+        private string BuildFrameMetadataJson(ParticipantInfo participant, uint? msi)
+        {
+            var streamId = participant?.ParticipantId
+                ?? (msi.HasValue ? $"msi-{msi.Value}" : "unknown-stream");
+
+            var sb = new StringBuilder();
+            sb.Append("{");
+            sb.AppendFormat("\"callId\":\"{0}\",", this.currentSessionId);
+            sb.AppendFormat("\"streamId\":\"{0}\",", streamId);
+            sb.AppendFormat("\"userId\":\"{0}\",", participant?.UserId ?? string.Empty);
+            sb.AppendFormat("\"displayName\":\"{0}\",", EscapeJsonString(participant?.DisplayName ?? string.Empty));
+            sb.AppendFormat("\"identityType\":\"{0}\",", participant?.IsAgent == true ? "agent" : "caller");
+            sb.AppendFormat("\"channelId\":{0},", participant?.ChannelId ?? 0);
+            sb.AppendFormat("\"participantTenantId\":\"{0}\",", participant?.TenantId ?? string.Empty);
+            sb.AppendFormat("\"configuredOrgId\":\"{0}\",", participant?.ConfiguredOrgId ?? this.configuredOrgId ?? string.Empty);
+            sb.AppendFormat("\"callerType\":\"{0}\",", participant?.CallerType ?? "EXTERNAL_TEAMS");
+            sb.AppendFormat("\"isInternal\":{0}", participant?.IsInternal == true ? "true" : "false");
+            sb.Append("}");
+            return sb.ToString();
+        }
+
+        private static string EscapeJsonString(string s)
+        {
+            return s.Replace("\\", "\\\\").Replace("\"", "\\\"");
         }
 
         private double CalculateAudioEnergy(byte[] audioData)
@@ -1194,26 +1224,23 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
         {
             try
             {
-                using (var ms = new MemoryStream())
+                var closeMeta = Encoding.UTF8.GetBytes(
+                    $"{{\"callId\":\"{this.currentSessionId}\",\"streamId\":\"eos\",\"endOfStream\":true}}");
+                var closeFrame = new byte[12 + closeMeta.Length];
+                Buffer.BlockCopy(Iab1Magic, 0, closeFrame, 0, 4);
+                Buffer.BlockCopy(BitConverter.GetBytes((uint)closeMeta.Length), 0, closeFrame, 4, 4);
+                Buffer.BlockCopy(BitConverter.GetBytes(0u), 0, closeFrame, 8, 4);
+                Buffer.BlockCopy(closeMeta, 0, closeFrame, 12, closeMeta.Length);
+
+                foreach (var client in this.connectedClients.Keys)
                 {
-                    byte[] sessionId = Encoding.ASCII.GetBytes(
-                        this.currentSessionId.PadRight(36).Substring(0, 36));
-                    ms.Write(sessionId, 0, 36);
-                    ms.WriteByte(255);
-                    ms.Write(BitConverter.GetBytes(0u), 0, 4);
-
-                    byte[] closeFrame = ms.ToArray();
-
-                    foreach (var client in this.connectedClients.Keys)
+                    try
                     {
-                        try
-                        {
-                            client.GetStream().Write(closeFrame, 0, closeFrame.Length);
-                            client.Close();
-                        }
-                        catch
-                        {
-                        }
+                        client.GetStream().Write(closeFrame, 0, closeFrame.Length);
+                        client.Close();
+                    }
+                    catch
+                    {
                     }
                 }
 
@@ -1590,6 +1617,8 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
             internal string SpeakerInfo { get; set; }
 
             internal string Confidence { get; set; }
+
+            internal ParticipantInfo Participant { get; set; }
         }
     }
 }
