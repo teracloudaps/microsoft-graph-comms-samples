@@ -39,7 +39,7 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
         private const double SILENCEENERGYTHRESHOLD = 100.0;
         private const double SPEAKERPERSISTENCEMS = 1000;
         private const double SPEAKERCHANGEDEBOUNCEMS = 500;
-        private const int MAXQUEUEDAUDIOFRAMES = 200;
+        private const int MAXQUEUEDAUDIOFRAMES = 1000;
         private const int MAXQUEUEDMETADATAMESSAGES = 100;
         private const int IAB1HEADERLEN = 12;
         private const int AUDIOSTREAMPORT = 5001;
@@ -68,6 +68,7 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
         private TcpListener audioStreamServer;
         private TcpListener metadataStreamServer;
         private int nextChannelIndex; // Atomic; monotonic; never reused after a participant leaves
+        private volatile ParticipantInfo cachedSdkUnboundCaller; // Non-null only when exactly one IsSdkUnbound real caller exists; lets the audio hot path adopt unknown MSIs without a LINQ scan per frame.
         private uint? currentDominantSpeakerMsi;
         private DateTime lastSpeakerChangeTime = DateTime.UtcNow;
         private string lastKnownSpeakerId;
@@ -433,6 +434,7 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
                     this.ProcessParticipant(participant, isNew: true);
                 }
 
+                bool removedAny = false;
                 foreach (var participant in args.RemovedResources)
                 {
                     var participantId = participant.Id;
@@ -450,7 +452,14 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
                         {
                             this.lastKnownSpeakerId = null;
                         }
+
+                        removedAny = true;
                     }
+                }
+
+                if (removedAny)
+                {
+                    this.RefreshCachedSdkUnboundCaller();
                 }
 
                 Console.WriteLine($"Total participants: {this.call.Participants.Count}");
@@ -607,6 +616,7 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
 
                         Console.WriteLine($" Merged anonymous participant '{participantId}' into '{mergeTarget.DisplayName}' (CH{mergeTarget.ChannelId}) via {heuristic}");
                         this.mergedParticipantTarget.TryAdd(participantId, mergeTarget.ParticipantId);
+                        this.RefreshCachedSdkUnboundCaller();
                         return;
                     }
                 }
@@ -648,6 +658,7 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
 
                 this.participantsById[participantId] = info;
                 this.SendParticipantEvent(info, "JOIN");
+                this.RefreshCachedSdkUnboundCaller();
             }
             catch (Exception ex)
             {
@@ -805,7 +816,13 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
                 System.Runtime.InteropServices.Marshal.Copy(
                     unmixedBuffer.Data, audioData, 0, (int)unmixedBuffer.Length);
 
-                var participant = this.ResolveParticipantByMsi(msi);
+                // ResolveParticipantByMsi may return null when audio arrives for a brand-new
+                // MSI before DominantSpeakerChanged fires (the SDK races these two streams).
+                // Eagerly adopt onto the cached sole SdkUnbound real caller so the FIRST
+                // frame is attributed correctly — fixes utterance-beginning attribution leaks
+                // and prevents Speaker-XXX placeholder streams from being created at all.
+                var participant = this.ResolveParticipantByMsi(msi)
+                    ?? this.TryEagerAdoptMsi(msi);
                 this.SendAudioFrame(audioData, participant);
             }
 
@@ -869,6 +886,61 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
             }
 
             return null;
+        }
+
+        // Refresh the cached sole SdkUnbound real caller. Called whenever the participant
+        // set changes (join/leave/merge/placeholder claim). If zero or 2+ SdkUnbound real
+        // callers exist, the cache is null and the audio path will not eager-adopt unknown
+        // MSIs — falling back to fallbackFrameMetadataBytes (consumer routes "unknown").
+        private void RefreshCachedSdkUnboundCaller()
+        {
+            ParticipantInfo found = null;
+            foreach (var p in this.participantsById.Values)
+            {
+                if (p.IsMsiFallback || !p.IsSdkUnbound || string.IsNullOrWhiteSpace(p.UserId))
+                {
+                    continue;
+                }
+
+                if (found != null)
+                {
+                    found = null;
+                    break;
+                }
+
+                found = p;
+            }
+
+            this.cachedSdkUnboundCaller = found;
+        }
+
+        // Bind an MSI to the cached SdkUnbound caller from the audio hot path. Atomic on
+        // msiToParticipantId; the local MediaStreamIds list update is best-effort (read by
+        // logging/diagnostics, not by the hot path). Returns the participant if adopted.
+        private ParticipantInfo TryEagerAdoptMsi(uint msi)
+        {
+            var target = this.cachedSdkUnboundCaller;
+            if (target == null)
+            {
+                return null;
+            }
+
+            if (this.msiToParticipantId.TryAdd(msi, target.ParticipantId))
+            {
+                lock (target.MediaStreamIds)
+                {
+                    if (!target.MediaStreamIds.Contains(msi))
+                    {
+                        target.MediaStreamIds.Add(msi);
+                    }
+                }
+
+                Console.WriteLine($"Eagerly adopted MSI {msi} for SDK-unbound caller '{target.DisplayName}' (CH{target.ChannelId}) from audio path");
+                return target;
+            }
+
+            // Another thread won the race; resolve and return whatever is now bound.
+            return this.ResolveParticipantByMsi(msi);
         }
 
         private ParticipantInfo ResolveSpeaker()
@@ -1000,6 +1072,14 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
                 {
                     var client = await this.audioStreamServer.AcceptTcpClientAsync().ConfigureAwait(false);
                     client.NoDelay = true;
+
+                    // Without a send timeout, a consumer whose receive buffer fills (slow
+                    // downstream like AWS Transcribe back-pressure) causes the synchronous
+                    // stream.Write in WriteAudioFrameToClients to block forever, freezing
+                    // audio relay for ALL clients. 5s is well past any legitimate scheduling
+                    // hiccup; on timeout, IOException bubbles up and RemoveAudioClient runs.
+                    client.SendTimeout = 5000;
+
                     Console.WriteLine($"Audio client connected: {((IPEndPoint)client.Client.RemoteEndPoint).Address}");
                     this.connectedClients[client] = 0;
                 }
