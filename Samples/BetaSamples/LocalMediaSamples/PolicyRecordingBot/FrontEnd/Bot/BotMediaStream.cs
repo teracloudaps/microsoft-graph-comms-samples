@@ -529,24 +529,35 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
                     }
                 }
 
-                // If a real participant arrives with no MSI in MediaStreams, claim the
-                // oldest unowned MSI-fallback placeholder. This is the reverse of the
-                // dominant-speaker adoption path and covers the timing where audio
-                // arrives first (placeholder created), then identity resolves. Only fires
-                // for identity-resolved real participants — anonymous shadows go through
-                // the merge logic below instead.
-                if (!string.IsNullOrWhiteSpace(userId) && mediaStreamIds.Count == 0)
+                // Capture SDK exposure now, before placeholder claiming mutates mediaStreamIds.
+                // Sticky: a participant who had no Send/SendReceive MediaStream from the SDK
+                // remains the absorber for unbound MSIs even after claiming a placeholder, so
+                // a later distinct MSI for their voice routes to them rather than a new placeholder.
+                bool isSdkUnbound = !string.IsNullOrWhiteSpace(userId) && mediaStreamIds.Count == 0;
+
+                // If a real participant arrives with no MSI in MediaStreams, claim ALL outstanding
+                // MSI-fallback placeholders. This is the reverse of the dominant-speaker adoption
+                // path and covers the timing where audio arrives first (one or more placeholders
+                // created), then identity resolves. Aggressive (all-placeholders) because in the
+                // policy-bot scenario every unbound MSI belongs to the same single absorber.
+                if (isSdkUnbound)
                 {
-                    var orphanPlaceholder = this.participantsById.Values
+                    var orphanPlaceholders = this.participantsById.Values
                         .Where(p => p.IsMsiFallback)
                         .OrderBy(p => p.JoinTime)
-                        .FirstOrDefault();
+                        .ToList();
 
-                    if (orphanPlaceholder != null && orphanPlaceholder.MediaStreamIds != null)
+                    foreach (var orphanPlaceholder in orphanPlaceholders)
                     {
-                        foreach (var msi in orphanPlaceholder.MediaStreamIds)
+                        if (orphanPlaceholder.MediaStreamIds != null)
                         {
-                            mediaStreamIds.Add(msi);
+                            foreach (var msi in orphanPlaceholder.MediaStreamIds)
+                            {
+                                if (!mediaStreamIds.Contains(msi))
+                                {
+                                    mediaStreamIds.Add(msi);
+                                }
+                            }
                         }
 
                         if (this.participantsById.TryRemove(orphanPlaceholder.ParticipantId, out var evicted))
@@ -559,12 +570,12 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
 
                 // Anonymous shadow participants (no userId) are merged into a real caller.
                 // The Teams SDK frequently reports a real participant first (with no MSI in
-                // MediaStreams) and then a separate anonymous shadow carrying that participant's
-                // audio MSI. The shadow's most likely owner is therefore a real caller that
-                // doesn't yet have any MSI mapped. Prefer the oldest-joined such caller; fall
-                // back to the most-recently-joined real caller only if all already have MSIs.
-                // mergedParticipantTarget locks the decision so a later OnParticipantsUpdated
-                // re-fire cannot flip the target.
+                // MediaStreams) and then a separate anonymous shadow that mirrors them. The
+                // shadow's most likely owner is the SDK-unbound real caller (the policy-attached
+                // user) — even if that caller has already absorbed unbound MSIs, they remain
+                // the right merge target. Fall back to the most-recently-joined real caller
+                // only if no SDK-unbound caller exists. mergedParticipantTarget locks the
+                // decision so a later OnParticipantsUpdated re-fire cannot flip the target.
                 if (string.IsNullOrWhiteSpace(userId))
                 {
                     var realCallers = this.participantsById.Values
@@ -572,7 +583,7 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
                         .ToList();
 
                     var mergeTarget = realCallers
-                        .Where(p => p.MediaStreamIds == null || p.MediaStreamIds.Count == 0)
+                        .Where(p => p.IsSdkUnbound)
                         .OrderBy(p => p.JoinTime)
                         .FirstOrDefault()
                         ?? realCallers
@@ -581,8 +592,8 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
 
                     if (mergeTarget != null)
                     {
-                        var heuristic = mergeTarget.MediaStreamIds == null || mergeTarget.MediaStreamIds.Count == 0
-                            ? "no-MSI-yet"
+                        var heuristic = mergeTarget.IsSdkUnbound
+                            ? "sdk-unbound"
                             : "most-recent-fallback";
 
                         foreach (var msi in mediaStreamIds)
@@ -609,6 +620,7 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
                     DisplayName = displayName,
                     TenantId = tenantId,
                     ChannelId = channelId,
+                    IsSdkUnbound = isSdkUnbound,
                     MediaStreamIds = mediaStreamIds,
                     JoinTime = DateTime.UtcNow,
                 };
@@ -665,23 +677,35 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
 
                 if (!this.msiToParticipantId.ContainsKey(e.CurrentDominantSpeaker))
                 {
-                    // The Teams SDK frequently lights up an audio MSI via the dominant-speaker
-                    // event *before* (or instead of) populating it in the corresponding
-                    // participant's MediaStreams. If a real participant has joined but does
-                    // not yet have any MSI bound, attribute this MSI to them rather than
-                    // building an anonymous "Speaker-N" placeholder. Oldest-joined wins so
-                    // multiple unbound real participants resolve deterministically.
-                    var orphanedRealCaller = this.participantsById.Values
-                        .Where(p => !p.IsMsiFallback && !string.IsNullOrWhiteSpace(p.UserId))
-                        .Where(p => p.MediaStreamIds == null || p.MediaStreamIds.Count == 0)
-                        .OrderBy(p => p.JoinTime)
-                        .FirstOrDefault();
+                    // The Teams SDK lights up audio MSIs via the dominant-speaker event for
+                    // policy-attached users whose MediaStreams are never populated, and the
+                    // SDK may use *different* MSIs over the call's lifetime for the same
+                    // speaker (renegotiation, codec change, etc). Route every unbound MSI to
+                    // the same SDK-unbound real caller (sticky by IsSdkUnbound, not by current
+                    // MediaStreamIds — once we adopt MSI N, the caller is no longer "orphan"
+                    // by stream count but still owns subsequent unbound MSIs).
+                    //
+                    // If 0 or 2+ SDK-unbound real callers exist the attribution is ambiguous —
+                    // fall back to a placeholder and let the consumer resolve it.
+                    var sdkUnboundCandidates = this.participantsById.Values
+                        .Where(p => !p.IsMsiFallback && p.IsSdkUnbound && !string.IsNullOrWhiteSpace(p.UserId))
+                        .ToList();
 
-                    if (orphanedRealCaller != null)
+                    if (sdkUnboundCandidates.Count == 1)
                     {
-                        orphanedRealCaller.MediaStreamIds.Add(e.CurrentDominantSpeaker);
-                        this.msiToParticipantId[e.CurrentDominantSpeaker] = orphanedRealCaller.ParticipantId;
-                        Console.WriteLine($"Adopted MSI {e.CurrentDominantSpeaker} for previously-unbound real caller '{orphanedRealCaller.DisplayName}' (CH{orphanedRealCaller.ChannelId})");
+                        var target = sdkUnboundCandidates[0];
+                        if (target.MediaStreamIds == null)
+                        {
+                            target.MediaStreamIds = new List<uint>();
+                        }
+
+                        if (!target.MediaStreamIds.Contains(e.CurrentDominantSpeaker))
+                        {
+                            target.MediaStreamIds.Add(e.CurrentDominantSpeaker);
+                        }
+
+                        this.msiToParticipantId[e.CurrentDominantSpeaker] = target.ParticipantId;
+                        Console.WriteLine($"Adopted MSI {e.CurrentDominantSpeaker} for SDK-unbound real caller '{target.DisplayName}' (CH{target.ChannelId})");
                     }
                     else
                     {
@@ -1291,6 +1315,14 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
             internal int ChannelId { get; set; }
 
             internal bool IsMsiFallback { get; set; }
+
+            // True if the SDK never exposed a Send/SendReceive audio MediaStream for this
+            // participant when it was created. Policy-attached users (the bot's host) typically
+            // have no such MediaStream; their audio arrives via dominant-speaker events on
+            // MSIs that the SDK assigns dynamically and may change over the call's lifetime.
+            // Sticky after creation so the participant remains the absorber for subsequently
+            // observed unbound MSIs, not just the first one.
+            internal bool IsSdkUnbound { get; set; }
 
             internal List<uint> MediaStreamIds { get; set; }
 
