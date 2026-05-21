@@ -914,9 +914,11 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
             this.cachedSdkUnboundCaller = found;
         }
 
-        // Bind an MSI to the cached SdkUnbound caller from the audio hot path. Atomic on
-        // msiToParticipantId; the local MediaStreamIds list update is best-effort (read by
-        // logging/diagnostics, not by the hot path). Returns the participant if adopted.
+        // Bind an MSI to the cached SdkUnbound caller from the audio hot path. The atomic
+        // ConcurrentDictionary insert is the source of truth for routing; the diagnostic
+        // MediaStreamIds list on ParticipantInfo is intentionally NOT mutated here — it's
+        // touched without locking from the SDK callback threads (ProcessParticipant merge,
+        // OnDominantSpeakerChanged adoption), and adding hot-path mutation would race.
         private ParticipantInfo TryEagerAdoptMsi(uint msi)
         {
             var target = this.cachedSdkUnboundCaller;
@@ -927,14 +929,6 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
 
             if (this.msiToParticipantId.TryAdd(msi, target.ParticipantId))
             {
-                lock (target.MediaStreamIds)
-                {
-                    if (!target.MediaStreamIds.Contains(msi))
-                    {
-                        target.MediaStreamIds.Add(msi);
-                    }
-                }
-
                 Console.WriteLine($"Eagerly adopted MSI {msi} for SDK-unbound caller '{target.DisplayName}' (CH{target.ChannelId}) from audio path");
                 return target;
             }
