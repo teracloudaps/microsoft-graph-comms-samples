@@ -45,6 +45,16 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
         private const int AUDIOSTREAMPORT = 5001;
         private const int METADATASTREAMPORT = 5002;
 
+        // Attribution key used in the pre-roll buffer for mixed-mode frames (which have no
+        // per-MSI key). uint.MaxValue is outside the SDK's MSI range so it cannot collide with
+        // a real unmixed-mode MSI key.
+        private const uint MIXEDMODEATTRIBUTIONKEY = uint.MaxValue;
+
+        // Bounds memory growth of the per-key pre-roll buffer. At ~50fps (20ms PCM frames)
+        // this is ~30 seconds — well beyond any observed real-world resolve window. In
+        // practice the buffer drains within a second of audio actually starting.
+        private const int MAXPREROLLFRAMESPERKEY = 1500;
+
         private static readonly byte[] Iab1Magic = { 0x49, 0x41, 0x42, 0x31 }; // "IAB1"
         private static readonly char[] HexDigits = "0123456789abcdef".ToCharArray();
 
@@ -61,9 +71,15 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
         private readonly ConcurrentDictionary<uint, string> msiToParticipantId = new ConcurrentDictionary<uint, string>();
         private readonly ConcurrentDictionary<string, string> mergedParticipantTarget = new ConcurrentDictionary<string, string>();
         private readonly string currentSessionId = Guid.NewGuid().ToString();
-        private readonly byte[] fallbackFrameMetadataBytes;
         private readonly Queue<double> recentAudioEnergy = new Queue<double>();
         private readonly CancellationTokenSource shutdownCts = new CancellationTokenSource();
+
+        // Audio frames whose attribution is not yet resolved, keyed by MSI (unmixed mode) or
+        // MIXEDMODEATTRIBUTIONKEY (mixed mode). Drained to the first resolving participant; the
+        // key is then recorded in resolvedAttributionKeys so post-resolution null-attribution
+        // frames are dropped (shipping them under any identity corrupts the consumer's stream state).
+        private readonly ConcurrentDictionary<uint, Queue<byte[]>> preRollAudioByKey = new ConcurrentDictionary<uint, Queue<byte[]>>();
+        private readonly ConcurrentDictionary<uint, byte> resolvedAttributionKeys = new ConcurrentDictionary<uint, byte>();
 
         private TcpListener audioStreamServer;
         private TcpListener metadataStreamServer;
@@ -99,7 +115,6 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
 
             this.mediaSession = mediaSession;
             this.call = call;
-            this.fallbackFrameMetadataBytes = BuildFallbackFrameMetadata(this.currentSessionId);
 
             this.audioSocket = mediaSession.AudioSocket;
             if (this.audioSocket == null)
@@ -252,17 +267,6 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
             this.StopAudioStreamServer();
             this.StopMetadataStreamServer();
             this.shutdownCts.Dispose();
-        }
-
-        private static byte[] BuildFallbackFrameMetadata(string sessionId)
-        {
-            var sb = new StringBuilder(64);
-            sb.Append('{');
-            AppendJsonString(sb, "callId", sessionId);
-            sb.Append(',');
-            AppendJsonString(sb, "streamId", "unknown");
-            sb.Append('}');
-            return Encoding.UTF8.GetBytes(sb.ToString());
         }
 
         private static byte[] BuildFrameMetadata(string sessionId, ParticipantInfo info)
@@ -819,11 +823,12 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
                 // ResolveParticipantByMsi may return null when audio arrives for a brand-new
                 // MSI before DominantSpeakerChanged fires (the SDK races these two streams).
                 // Eagerly adopt onto the cached sole SdkUnbound real caller so the FIRST
-                // frame is attributed correctly — fixes utterance-beginning attribution leaks
-                // and prevents Speaker-XXX placeholder streams from being created at all.
+                // frame is attributed correctly. If both paths return null (0 or 2+ SdkUnbound
+                // callers), EmitOrBufferFrame holds the frame in the per-MSI pre-roll buffer
+                // until DominantSpeakerChanged binds the MSI.
                 var participant = this.ResolveParticipantByMsi(msi)
                     ?? this.TryEagerAdoptMsi(msi);
-                this.SendAudioFrame(audioData, participant);
+                this.EmitOrBufferFrame(msi, audioData, participant);
             }
 
             this.MaybeLogStatistics();
@@ -872,9 +877,65 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
             }
 
             var participant = this.ResolveSpeaker();
-            this.SendAudioFrame(audioData, participant);
+            this.EmitOrBufferFrame(MIXEDMODEATTRIBUTIONKEY, audioData, participant);
 
             this.MaybeLogStatistics();
+        }
+
+        // Unified emission path. If attribution resolved, emit immediately; on the FIRST
+        // resolution for this key, also drain any pre-roll frames that arrived during the
+        // startup race and attribute them to the same participant (the SDK fires
+        // DominantSpeakerChanged after some accumulation, so buffered frames are most likely
+        // the same speaker — or silence, where attribution is best-effort).
+        //
+        // If attribution failed AND this key has resolved before, drop the frame. Shipping
+        // under a sentinel identity creates a phantom stream that collides with real streams
+        // downstream (the consumer auto-assigns a channel for the unknown streamId, which
+        // collides with a real participant's channel and corrupts session state — observed
+        // with AWS Transcribe restarting mid-call).
+        //
+        // If attribution failed AND this key has not yet resolved, buffer the frame. Bounded
+        // by MAXPREROLLFRAMESPERKEY; oldest dropped on overflow. In every observed real-world
+        // trace the overflowed frames have been pure silence (the SDK doesn't fire
+        // DominantSpeakerChanged until energy crosses a threshold, so the only frames that
+        // arrive without attribution are below that threshold).
+        private void EmitOrBufferFrame(uint attributionKey, byte[] audioData, ParticipantInfo participant)
+        {
+            if (participant != null)
+            {
+                if (this.resolvedAttributionKeys.TryAdd(attributionKey, 0) &&
+                    this.preRollAudioByKey.TryRemove(attributionKey, out var pending))
+                {
+                    lock (pending)
+                    {
+                        while (pending.Count > 0)
+                        {
+                            this.SendAudioFrame(pending.Dequeue(), participant);
+                        }
+                    }
+                }
+
+                this.SendAudioFrame(audioData, participant);
+                return;
+            }
+
+            if (this.resolvedAttributionKeys.ContainsKey(attributionKey))
+            {
+                Interlocked.Increment(ref this.droppedAudioFrameCount);
+                return;
+            }
+
+            var queue = this.preRollAudioByKey.GetOrAdd(attributionKey, _ => new Queue<byte[]>());
+            lock (queue)
+            {
+                if (queue.Count >= MAXPREROLLFRAMESPERKEY)
+                {
+                    queue.Dequeue();
+                    Interlocked.Increment(ref this.droppedAudioFrameCount);
+                }
+
+                queue.Enqueue(audioData);
+            }
         }
 
         private ParticipantInfo ResolveParticipantByMsi(uint msi)
@@ -891,7 +952,8 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
         // Refresh the cached sole SdkUnbound real caller. Called whenever the participant
         // set changes (join/leave/merge/placeholder claim). If zero or 2+ SdkUnbound real
         // callers exist, the cache is null and the audio path will not eager-adopt unknown
-        // MSIs — falling back to fallbackFrameMetadataBytes (consumer routes "unknown").
+        // MSIs — EmitOrBufferFrame then holds those frames in the per-MSI pre-roll buffer
+        // until DominantSpeakerChanged binds the MSI.
         private void RefreshCachedSdkUnboundCaller()
         {
             ParticipantInfo found = null;
@@ -971,12 +1033,15 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
 
         private void SendAudioFrame(byte[] audioData, ParticipantInfo participant)
         {
-            if (this.connectedClients.IsEmpty)
+            // participant is non-null on every path that reaches here — EmitOrBufferFrame
+            // buffers unresolved frames rather than sending them, and ProcessSilenceForUnmixedMode
+            // iterates over participantsById.Values. The null guard is defensive.
+            if (this.connectedClients.IsEmpty || participant == null)
             {
                 return;
             }
 
-            byte[] metadataBytes = participant?.FrameMetadataBytes ?? this.fallbackFrameMetadataBytes;
+            byte[] metadataBytes = participant.FrameMetadataBytes;
 
             var frame = new byte[IAB1HEADERLEN + metadataBytes.Length + audioData.Length];
             Buffer.BlockCopy(Iab1Magic, 0, frame, 0, 4);
