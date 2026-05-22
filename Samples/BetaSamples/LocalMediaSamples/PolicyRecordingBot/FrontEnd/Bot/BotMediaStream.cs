@@ -50,13 +50,16 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
         // a real unmixed-mode MSI key.
         private const uint MIXEDMODEATTRIBUTIONKEY = uint.MaxValue;
 
-        // Bounds memory growth of the per-key pre-roll buffer. At ~50fps (20ms PCM frames)
-        // this is ~30 seconds — well beyond any observed real-world resolve window. In
-        // practice the buffer drains within a second of audio actually starting.
-        private const int MAXPREROLLFRAMESPERKEY = 1500;
+        // Bounds memory growth of the per-key pre-roll buffer and the size of the drain
+        // burst at resolution. ~5 seconds at 50fps — well past typical SDK resolution
+        // latency (a few hundred ms after speech onset) and aligned with SPEAKERPERSISTENCEMS
+        // (which already covers brief mid-call gaps). Larger values create GC + audioFrameQueue
+        // pressure when the buffer drains in one go.
+        private const int MAXPREROLLFRAMESPERKEY = 250;
 
         private static readonly byte[] Iab1Magic = { 0x49, 0x41, 0x42, 0x31 }; // "IAB1"
         private static readonly char[] HexDigits = "0123456789abcdef".ToCharArray();
+        private static readonly Func<uint, Queue<byte[]>> CreatePreRollQueue = _ => new Queue<byte[]>();
 
         private readonly IAudioSocket audioSocket;
         private readonly IVideoSocket vbssSocket;
@@ -75,11 +78,11 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
         private readonly CancellationTokenSource shutdownCts = new CancellationTokenSource();
 
         // Audio frames whose attribution is not yet resolved, keyed by MSI (unmixed mode) or
-        // MIXEDMODEATTRIBUTIONKEY (mixed mode). Drained to the first resolving participant; the
-        // key is then recorded in resolvedAttributionKeys so post-resolution null-attribution
-        // frames are dropped (shipping them under any identity corrupts the consumer's stream state).
+        // MIXEDMODEATTRIBUTIONKEY (mixed mode). Drained to the resolving participant on the
+        // next attributed emit. No sticky "resolved" state — mid-call binding races (new
+        // speaker's MSI arrives via DominantSpeakerChanged but isn't in msiToParticipantId yet)
+        // re-buffer and re-drain naturally, so utterance onsets are preserved.
         private readonly ConcurrentDictionary<uint, Queue<byte[]>> preRollAudioByKey = new ConcurrentDictionary<uint, Queue<byte[]>>();
-        private readonly ConcurrentDictionary<uint, byte> resolvedAttributionKeys = new ConcurrentDictionary<uint, byte>();
 
         private TcpListener audioStreamServer;
         private TcpListener metadataStreamServer;
@@ -882,28 +885,25 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
             this.MaybeLogStatistics();
         }
 
-        // Unified emission path. If attribution resolved, emit immediately; on the FIRST
-        // resolution for this key, also drain any pre-roll frames that arrived during the
-        // startup race and attribute them to the same participant (the SDK fires
-        // DominantSpeakerChanged after some accumulation, so buffered frames are most likely
-        // the same speaker — or silence, where attribution is best-effort).
+        // Unified emission path used by both mixed (key = MIXEDMODEATTRIBUTIONKEY) and
+        // unmixed (key = MSI) audio. Replaces the original ship-as-streamId=unknown fallback,
+        // which created phantom streams on the consumer side that collided with real channels
+        // (AWS Transcribe saw "restart" mid-call and dropped the session).
         //
-        // If attribution failed AND this key has resolved before, drop the frame. Shipping
-        // under a sentinel identity creates a phantom stream that collides with real streams
-        // downstream (the consumer auto-assigns a channel for the unknown streamId, which
-        // collides with a real participant's channel and corrupts session state — observed
-        // with AWS Transcribe restarting mid-call).
+        // Semantics: if attribution succeeded, drain any frames buffered for this key and emit
+        // the current frame. If attribution failed, buffer the current frame. The buffer is
+        // bounded by MAXPREROLLFRAMESPERKEY (~5s); overflow drops the oldest. There is no
+        // sticky "resolved once" state — a mid-call gap (e.g., a new speaker's MSI is reported
+        // dominant before OnDominantSpeakerChanged binds it) re-buffers and re-drains on the
+        // very next attributed emit, so utterance onsets are not lost.
         //
-        // If attribution failed AND this key has not yet resolved, buffer the frame. Bounded
-        // by MAXPREROLLFRAMESPERKEY; oldest dropped on overflow. In every observed real-world
-        // trace the overflowed frames have been pure silence (the SDK doesn't fire
-        // DominantSpeakerChanged until energy crosses a threshold, so the only frames that
-        // arrive without attribution are below that threshold).
+        // Hot-path cost: when there is no pending buffer (the steady state), the only work is
+        // a lock-free ContainsKey check, then SendAudioFrame. No dictionary locks taken.
         private void EmitOrBufferFrame(uint attributionKey, byte[] audioData, ParticipantInfo participant)
         {
             if (participant != null)
             {
-                if (this.resolvedAttributionKeys.TryAdd(attributionKey, 0) &&
+                if (this.preRollAudioByKey.ContainsKey(attributionKey) &&
                     this.preRollAudioByKey.TryRemove(attributionKey, out var pending))
                 {
                     lock (pending)
@@ -919,13 +919,7 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
                 return;
             }
 
-            if (this.resolvedAttributionKeys.ContainsKey(attributionKey))
-            {
-                Interlocked.Increment(ref this.droppedAudioFrameCount);
-                return;
-            }
-
-            var queue = this.preRollAudioByKey.GetOrAdd(attributionKey, _ => new Queue<byte[]>());
+            var queue = this.preRollAudioByKey.GetOrAdd(attributionKey, CreatePreRollQueue);
             lock (queue)
             {
                 if (queue.Count >= MAXPREROLLFRAMESPERKEY)
