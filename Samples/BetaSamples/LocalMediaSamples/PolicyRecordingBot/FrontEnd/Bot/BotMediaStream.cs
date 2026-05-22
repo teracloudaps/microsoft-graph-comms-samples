@@ -35,26 +35,16 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
     /// </summary>
     internal class BotMediaStream : ObjectRootDisposable
     {
-        private const int ENERGYHISTORYSIZE = 10;
-        private const double SILENCEENERGYTHRESHOLD = 100.0;
-        private const double SPEAKERPERSISTENCEMS = 1000;
-        private const double SPEAKERCHANGEDEBOUNCEMS = 500;
         private const int MAXQUEUEDAUDIOFRAMES = 1000;
         private const int MAXQUEUEDMETADATAMESSAGES = 100;
         private const int IAB1HEADERLEN = 12;
         private const int AUDIOSTREAMPORT = 5001;
         private const int METADATASTREAMPORT = 5002;
 
-        // Attribution key used in the pre-roll buffer for mixed-mode frames (which have no
-        // per-MSI key). uint.MaxValue is outside the SDK's MSI range so it cannot collide with
-        // a real unmixed-mode MSI key.
-        private const uint MIXEDMODEATTRIBUTIONKEY = uint.MaxValue;
-
-        // Bounds memory growth of the per-key pre-roll buffer and the size of the drain
-        // burst at resolution. ~5 seconds at 50fps — well past typical SDK resolution
-        // latency (a few hundred ms after speech onset) and aligned with SPEAKERPERSISTENCEMS
-        // (which already covers brief mid-call gaps). Larger values create GC + audioFrameQueue
-        // pressure when the buffer drains in one go.
+        // Bounds memory growth of the per-MSI pre-roll buffer and the size of the drain
+        // burst at resolution. ~5 seconds at 50fps — well past the brief window between
+        // an unmixed buffer arriving for a brand-new MSI and OnDominantSpeakerChanged
+        // binding it.
         private const int MAXPREROLLFRAMESPERKEY = 250;
 
         private static readonly byte[] Iab1Magic = { 0x49, 0x41, 0x42, 0x31 }; // "IAB1"
@@ -74,31 +64,26 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
         private readonly ConcurrentDictionary<uint, string> msiToParticipantId = new ConcurrentDictionary<uint, string>();
         private readonly ConcurrentDictionary<string, string> mergedParticipantTarget = new ConcurrentDictionary<string, string>();
         private readonly string currentSessionId = Guid.NewGuid().ToString();
-        private readonly Queue<double> recentAudioEnergy = new Queue<double>();
         private readonly CancellationTokenSource shutdownCts = new CancellationTokenSource();
 
-        // Audio frames whose attribution is not yet resolved, keyed by MSI (unmixed mode) or
-        // MIXEDMODEATTRIBUTIONKEY (mixed mode). Drained to the resolving participant on the
-        // next attributed emit. No sticky "resolved" state — mid-call binding races (new
-        // speaker's MSI arrives via DominantSpeakerChanged but isn't in msiToParticipantId yet)
-        // re-buffer and re-drain naturally, so utterance onsets are preserved.
+        // Audio frames whose attribution is not yet resolved, keyed by MSI. Drained to the
+        // resolving participant on the next attributed emit for that MSI. Covers the brief
+        // race where an unmixed buffer for a new MSI arrives before OnDominantSpeakerChanged
+        // binds it (or before TryEagerAdoptMsi can absorb it onto the cached SDK-unbound
+        // caller). No sticky "resolved" state — utterance onsets are preserved across any
+        // re-occurrence of the race.
         private readonly ConcurrentDictionary<uint, Queue<byte[]>> preRollAudioByKey = new ConcurrentDictionary<uint, Queue<byte[]>>();
 
         private TcpListener audioStreamServer;
         private TcpListener metadataStreamServer;
         private int nextChannelIndex; // Atomic; monotonic; never reused after a participant leaves
         private volatile ParticipantInfo cachedSdkUnboundCaller; // Non-null only when exactly one IsSdkUnbound real caller exists; lets the audio hot path adopt unknown MSIs without a LINQ scan per frame.
-        private uint? currentDominantSpeakerMsi;
-        private DateTime lastSpeakerChangeTime = DateTime.UtcNow;
-        private string lastKnownSpeakerId;
-        private DateTime lastKnownSpeakerTime = DateTime.UtcNow;
-        private long mixedPacketCount;
         private long unmixedPacketCount;
         private long silencePacketCount;
+        private long unattributedPacketCount; // Increments when the SDK delivers a frame that is neither unmixed nor silence — indicates ReceiveUnmixedMeetingAudio is not in effect (misconfiguration or guest-join).
         private long droppedAudioFrameCount;
         private long droppedMetadataMessageCount;
         private DateTime lastStatsLog = DateTime.UtcNow;
-        private bool unmixedAudioEnabled;
         private bool detailedLogging = false;
         private System.Timers.Timer participantCheckTimer;
         private int participantCheckCount;
@@ -455,11 +440,6 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
                         Console.WriteLine($"Participant LEFT: {info.DisplayName} (CH{info.ChannelId})");
                         this.SendParticipantEvent(info, "LEAVE");
 
-                        if (this.lastKnownSpeakerId == participantId)
-                        {
-                            this.lastKnownSpeakerId = null;
-                        }
-
                         removedAny = true;
                     }
                 }
@@ -673,88 +653,62 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
             }
         }
 
+        // With ReceiveUnmixedMeetingAudio=true, per-frame attribution comes from
+        // UnmixedAudioBuffer.ActiveSpeakerId — we no longer need the dominant-speaker event
+        // for "who's speaking now." It is still useful for two narrow jobs:
+        //   1. Adopt a brand-new MSI onto the cached SDK-unbound real caller (the policy-
+        //      attached user, whose Resource.MediaStreams is empty so we cannot bind at JOIN).
+        //   2. Create a placeholder ParticipantInfo when the MSI cannot be attributed to any
+        //      known caller (0 or 2+ SDK-unbound real callers — ambiguous).
+        // Both let ProcessUnmixedAudio land on a bound MSI by the next frame, draining any
+        // pre-roll buffer for that MSI.
         private void OnDominantSpeakerChanged(object sender, DominantSpeakerChangedEventArgs e)
         {
             try
             {
-                var now = DateTime.UtcNow;
-                var elapsed = (now - this.lastSpeakerChangeTime).TotalMilliseconds;
-                if (elapsed < SPEAKERCHANGEDEBOUNCEMS && this.currentDominantSpeakerMsi.HasValue)
+                if (e.CurrentDominantSpeaker == DominantSpeakerChangedEventArgs.None ||
+                    this.msiToParticipantId.ContainsKey(e.CurrentDominantSpeaker))
                 {
                     return;
                 }
 
-                if (e.CurrentDominantSpeaker == DominantSpeakerChangedEventArgs.None)
+                var sdkUnboundCandidates = this.participantsById.Values
+                    .Where(p => !p.IsMsiFallback && p.IsSdkUnbound && !string.IsNullOrWhiteSpace(p.UserId))
+                    .ToList();
+
+                if (sdkUnboundCandidates.Count == 1)
                 {
-                    this.currentDominantSpeakerMsi = null;
-                    return;
+                    var target = sdkUnboundCandidates[0];
+                    if (target.MediaStreamIds == null)
+                    {
+                        target.MediaStreamIds = new List<uint>();
+                    }
+
+                    if (!target.MediaStreamIds.Contains(e.CurrentDominantSpeaker))
+                    {
+                        target.MediaStreamIds.Add(e.CurrentDominantSpeaker);
+                    }
+
+                    this.msiToParticipantId[e.CurrentDominantSpeaker] = target.ParticipantId;
+                    Console.WriteLine($"Adopted MSI {e.CurrentDominantSpeaker} for SDK-unbound real caller '{target.DisplayName}' (CH{target.ChannelId})");
                 }
-
-                this.currentDominantSpeakerMsi = e.CurrentDominantSpeaker;
-                this.lastSpeakerChangeTime = now;
-
-                if (!this.msiToParticipantId.ContainsKey(e.CurrentDominantSpeaker))
+                else
                 {
-                    // The Teams SDK lights up audio MSIs via the dominant-speaker event for
-                    // policy-attached users whose MediaStreams are never populated, and the
-                    // SDK may use *different* MSIs over the call's lifetime for the same
-                    // speaker (renegotiation, codec change, etc). Route every unbound MSI to
-                    // the same SDK-unbound real caller (sticky by IsSdkUnbound, not by current
-                    // MediaStreamIds — once we adopt MSI N, the caller is no longer "orphan"
-                    // by stream count but still owns subsequent unbound MSIs).
-                    //
-                    // If 0 or 2+ SDK-unbound real callers exist the attribution is ambiguous —
-                    // fall back to a placeholder and let the consumer resolve it.
-                    var sdkUnboundCandidates = this.participantsById.Values
-                        .Where(p => !p.IsMsiFallback && p.IsSdkUnbound && !string.IsNullOrWhiteSpace(p.UserId))
-                        .ToList();
-
-                    if (sdkUnboundCandidates.Count == 1)
+                    var placeholderId = $"MSI-{e.CurrentDominantSpeaker}";
+                    int channelId = Interlocked.Increment(ref this.nextChannelIndex) - 1;
+                    var placeholder = new ParticipantInfo
                     {
-                        var target = sdkUnboundCandidates[0];
-                        if (target.MediaStreamIds == null)
-                        {
-                            target.MediaStreamIds = new List<uint>();
-                        }
-
-                        if (!target.MediaStreamIds.Contains(e.CurrentDominantSpeaker))
-                        {
-                            target.MediaStreamIds.Add(e.CurrentDominantSpeaker);
-                        }
-
-                        this.msiToParticipantId[e.CurrentDominantSpeaker] = target.ParticipantId;
-                        Console.WriteLine($"Adopted MSI {e.CurrentDominantSpeaker} for SDK-unbound real caller '{target.DisplayName}' (CH{target.ChannelId})");
-                    }
-                    else
-                    {
-                        var placeholderId = $"MSI-{e.CurrentDominantSpeaker}";
-                        int channelId = Interlocked.Increment(ref this.nextChannelIndex) - 1;
-                        var placeholder = new ParticipantInfo
-                        {
-                            ParticipantId = placeholderId,
-                            DisplayName = $"Speaker-{e.CurrentDominantSpeaker}",
-                            ChannelId = channelId,
-                            IsMsiFallback = true,
-                            MediaStreamIds = new List<uint> { e.CurrentDominantSpeaker },
-                            JoinTime = now,
-                        };
-                        placeholder.FrameMetadataBytes = BuildFrameMetadata(this.currentSessionId, placeholder);
-                        this.msiToParticipantId[e.CurrentDominantSpeaker] = placeholderId;
-                        this.participantsById[placeholderId] = placeholder;
-                        Console.WriteLine($"MSI-FALLBACK: Registered placeholder for MSI {e.CurrentDominantSpeaker} on CH{channelId}");
-                    }
-                }
-
-                if (this.msiToParticipantId.TryGetValue(e.CurrentDominantSpeaker, out var pid) &&
-                    this.participantsById.TryGetValue(pid, out var info))
-                {
-                    var speakerChanged = this.lastKnownSpeakerId != pid;
-                    this.lastKnownSpeakerId = pid;
-                    this.lastKnownSpeakerTime = now;
-                    if (speakerChanged)
-                    {
-                        Console.WriteLine($"Speaker resolved: MSI {e.CurrentDominantSpeaker} -> {info.DisplayName} (userId={info.UserId ?? "<empty>"}, CH{info.ChannelId}, fallback={info.IsMsiFallback})");
-                    }
+                        ParticipantId = placeholderId,
+                        DisplayName = $"Speaker-{e.CurrentDominantSpeaker}",
+                        ChannelId = channelId,
+                        IsMsiFallback = true,
+                        MediaStreamIds = new List<uint> { e.CurrentDominantSpeaker },
+                        JoinTime = DateTime.UtcNow,
+                    };
+                    placeholder.FrameMetadataBytes = BuildFrameMetadata(this.currentSessionId, placeholder);
+                    this.msiToParticipantId[e.CurrentDominantSpeaker] = placeholderId;
+                    this.participantsById[placeholderId] = placeholder;
+                    Console.WriteLine($"MSI-FALLBACK: Registered placeholder for MSI {e.CurrentDominantSpeaker} on CH{channelId}");
                 }
             }
             catch (Exception ex)
@@ -772,6 +726,10 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
                     return;
                 }
 
+                // Primary path: per-speaker buffers. ReceiveUnmixedMeetingAudio=true on the
+                // AudioSocketSettings makes this populated on every event with one buffer per
+                // active speaker (up to 4 concurrent). Iterating gives per-frame attribution
+                // via ActiveSpeakerId; no dominant-speaker resolution needed.
                 if (e.Buffer.UnmixedAudioBuffers != null)
                 {
                     try
@@ -784,17 +742,26 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
                     }
                     catch (ArgumentNullException)
                     {
-                        // Buffer not initialized — fall through to mixed mode
+                        // Buffer not initialized — treat as silence/idle.
                     }
                 }
 
-                if (e.Buffer.IsSilence && this.unmixedAudioEnabled)
+                // Silence keepalive: when no one is speaking the SDK delivers an IsSilence
+                // buffer (no unmixed entries). Broadcast it to every tracked participant so
+                // per-participant downstream sessions (e.g. AWS Transcribe) don't time out.
+                if (e.Buffer.IsSilence)
                 {
                     this.ProcessSilenceForUnmixedMode(e);
                     return;
                 }
 
-                this.ProcessMixedAudio(e);
+                // Should not reach here when ReceiveUnmixedMeetingAudio is in effect. If it
+                // does, the SDK is delivering a mixed buffer (most commonly: bot joined as
+                // guest with a DisplayName, which silently disables unmixed delivery). The
+                // counter surfaces the misconfiguration in STATS; the frame is dropped on
+                // purpose — we can't attribute a mixed buffer without inventing a phantom
+                // stream, which is exactly what the previous design got wrong.
+                Interlocked.Increment(ref this.unattributedPacketCount);
             }
             catch (Exception ex)
             {
@@ -810,12 +777,6 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
         {
             Interlocked.Increment(ref this.unmixedPacketCount);
 
-            if (!this.unmixedAudioEnabled)
-            {
-                this.unmixedAudioEnabled = true;
-                Console.WriteLine($" UNMIXED AUDIO MODE ENABLED ({e.Buffer.UnmixedAudioBuffers.Count()} streams)");
-            }
-
             foreach (var unmixedBuffer in e.Buffer.UnmixedAudioBuffers)
             {
                 uint msi = unmixedBuffer.ActiveSpeakerId;
@@ -823,12 +784,12 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
                 System.Runtime.InteropServices.Marshal.Copy(
                     unmixedBuffer.Data, audioData, 0, (int)unmixedBuffer.Length);
 
-                // ResolveParticipantByMsi may return null when audio arrives for a brand-new
-                // MSI before DominantSpeakerChanged fires (the SDK races these two streams).
-                // Eagerly adopt onto the cached sole SdkUnbound real caller so the FIRST
-                // frame is attributed correctly. If both paths return null (0 or 2+ SdkUnbound
-                // callers), EmitOrBufferFrame holds the frame in the per-MSI pre-roll buffer
-                // until DominantSpeakerChanged binds the MSI.
+                // ResolveParticipantByMsi returns null when audio arrives for a brand-new MSI
+                // before OnDominantSpeakerChanged has bound it. Eager-adopt onto the cached
+                // sole SDK-unbound real caller (the policy-attached user) so the FIRST frame
+                // is attributed correctly. If neither path resolves (0 or 2+ SDK-unbound
+                // callers), EmitOrBufferFrame parks the frame in the per-MSI pre-roll buffer
+                // until OnDominantSpeakerChanged registers a placeholder for that MSI.
                 var participant = this.ResolveParticipantByMsi(msi)
                     ?? this.TryEagerAdoptMsi(msi);
                 this.EmitOrBufferFrame(msi, audioData, participant);
@@ -856,49 +817,15 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
             }
         }
 
-        private void ProcessMixedAudio(AudioMediaReceivedEventArgs e)
-        {
-            Interlocked.Increment(ref this.mixedPacketCount);
-
-            byte[] audioData = new byte[e.Buffer.Length];
-            System.Runtime.InteropServices.Marshal.Copy(
-                e.Buffer.Data, audioData, 0, (int)e.Buffer.Length);
-
-            double audioEnergy = this.CalculateAudioEnergy(audioData);
-            this.recentAudioEnergy.Enqueue(audioEnergy);
-            if (this.recentAudioEnergy.Count > ENERGYHISTORYSIZE)
-            {
-                this.recentAudioEnergy.Dequeue();
-            }
-
-            double avgEnergy = this.recentAudioEnergy.Count > 0 ? this.recentAudioEnergy.Average() : 0;
-            bool isTrueSilence = avgEnergy < SILENCEENERGYTHRESHOLD;
-
-            if (isTrueSilence)
-            {
-                Interlocked.Increment(ref this.silencePacketCount);
-            }
-
-            var participant = this.ResolveSpeaker();
-            this.EmitOrBufferFrame(MIXEDMODEATTRIBUTIONKEY, audioData, participant);
-
-            this.MaybeLogStatistics();
-        }
-
-        // Unified emission path used by both mixed (key = MIXEDMODEATTRIBUTIONKEY) and
-        // unmixed (key = MSI) audio. Replaces the original ship-as-streamId=unknown fallback,
-        // which created phantom streams on the consumer side that collided with real channels
-        // (AWS Transcribe saw "restart" mid-call and dropped the session).
+        // Emission path used by ProcessUnmixedAudio. The attributionKey is the MSI from
+        // UnmixedAudioBuffer.ActiveSpeakerId. If attribution succeeded, drain any frames
+        // buffered for that MSI (the brief race when a buffer arrives before the MSI is
+        // bound) and emit the current frame. If attribution failed, buffer the current frame
+        // until OnDominantSpeakerChanged registers a placeholder for it. Bounded by
+        // MAXPREROLLFRAMESPERKEY; overflow drops oldest.
         //
-        // Semantics: if attribution succeeded, drain any frames buffered for this key and emit
-        // the current frame. If attribution failed, buffer the current frame. The buffer is
-        // bounded by MAXPREROLLFRAMESPERKEY (~5s); overflow drops the oldest. There is no
-        // sticky "resolved once" state — a mid-call gap (e.g., a new speaker's MSI is reported
-        // dominant before OnDominantSpeakerChanged binds it) re-buffers and re-drains on the
-        // very next attributed emit, so utterance onsets are not lost.
-        //
-        // Hot-path cost: when there is no pending buffer (the steady state), the only work is
-        // a lock-free ContainsKey check, then SendAudioFrame. No dictionary locks taken.
+        // Hot-path cost in steady state: a single lock-free ContainsKey followed by
+        // SendAudioFrame — no dictionary locks taken once the MSI's pre-roll has drained.
         private void EmitOrBufferFrame(uint attributionKey, byte[] audioData, ParticipantInfo participant)
         {
             if (participant != null)
@@ -993,38 +920,6 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
             return this.ResolveParticipantByMsi(msi);
         }
 
-        private ParticipantInfo ResolveSpeaker()
-        {
-            if (this.currentDominantSpeakerMsi.HasValue)
-            {
-                var info = this.ResolveParticipantByMsi(this.currentDominantSpeakerMsi.Value);
-                if (info != null)
-                {
-                    return info;
-                }
-            }
-
-            if (!string.IsNullOrEmpty(this.lastKnownSpeakerId))
-            {
-                var elapsed = (DateTime.UtcNow - this.lastKnownSpeakerTime).TotalMilliseconds;
-                if (elapsed < SPEAKERPERSISTENCEMS &&
-                    this.participantsById.TryGetValue(this.lastKnownSpeakerId, out var info))
-                {
-                    return info;
-                }
-            }
-
-            if (this.participantsById.Count == 1)
-            {
-                foreach (var info in this.participantsById.Values)
-                {
-                    return info;
-                }
-            }
-
-            return null;
-        }
-
         private void SendAudioFrame(byte[] audioData, ParticipantInfo participant)
         {
             // participant is non-null on every path that reaches here — EmitOrBufferFrame
@@ -1062,18 +957,6 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
             }
         }
 
-        private double CalculateAudioEnergy(byte[] audioData)
-        {
-            double sum = 0;
-            for (int i = 0; i < audioData.Length - 1; i += 2)
-            {
-                short sample = BitConverter.ToInt16(audioData, i);
-                sum += sample * sample;
-            }
-
-            return Math.Sqrt(sum / (audioData.Length / 2));
-        }
-
         private void MaybeLogStatistics()
         {
             var now = DateTime.UtcNow;
@@ -1084,9 +967,9 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
 
             this.lastStatsLog = now;
             Console.WriteLine(
-                $"STATS: mixed={Interlocked.Read(ref this.mixedPacketCount)} " +
-                $"unmixed={Interlocked.Read(ref this.unmixedPacketCount)} " +
+                $"STATS: unmixed={Interlocked.Read(ref this.unmixedPacketCount)} " +
                 $"silence={Interlocked.Read(ref this.silencePacketCount)} " +
+                $"unattributed={Interlocked.Read(ref this.unattributedPacketCount)} " +
                 $"droppedAudio={Interlocked.Read(ref this.droppedAudioFrameCount)} " +
                 $"droppedMeta={Interlocked.Read(ref this.droppedMetadataMessageCount)} " +
                 $"participants={this.participantsById.Count}");

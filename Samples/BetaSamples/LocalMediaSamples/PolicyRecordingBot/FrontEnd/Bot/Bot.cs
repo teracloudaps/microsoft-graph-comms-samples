@@ -161,12 +161,19 @@ namespace Sample.PolicyRecordingBot.FrontEnd.Bot
                 },
             };
 
-            // create media session object, this is needed to establish call connections
+            // create media session object, this is needed to establish call connections.
+            // ReceiveUnmixedMeetingAudio=true opts in to per-speaker buffers — each
+            // AudioMediaReceived event carries one buffer per active speaker with the
+            // speaker's MSI in ActiveSpeakerId, instead of a single mixed buffer. This
+            // makes overlapping speakers separable and gives per-frame attribution from
+            // frame 1 (no waiting for DominantSpeakerChanged to fire on energy crossing).
+            // Pcm16K is the only audio format that delivers unmixed; do not change it.
             var mediaSession = this.Client.CreateMediaSession(
                 new AudioSocketSettings
                 {
                     StreamDirections = StreamDirection.Recvonly,
                     SupportedAudioFormat = AudioFormat.Pcm16K,
+                    ReceiveUnmixedMeetingAudio = true,
                 },
                 videoSocketSettings,
                 vbssSocketSettings,
